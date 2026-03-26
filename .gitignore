@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+venv/
+node_modules/
+.next/
+config/client_secret.json
+config/youtube_token.json
+data/
+*.mp4
+*.mp3
+*.png
+.DS_Store
