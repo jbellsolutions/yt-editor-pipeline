@@ -1,4 +1,69 @@
-# CLAUDE.md — Operational Rules
+# CLAUDE.md — YT Editor Pipeline
+
+This file tells Claude Code how to install, operate, and maintain this project. If a user says "install this for me" or "set this up", follow the installation guide below.
+
+---
+
+## Installation Guide (for Claude Code)
+
+When a user asks you to install this project, follow these steps in order. Do everything for them — they should only need to provide API keys and approve the Google OAuth step.
+
+### Prerequisites
+The user needs:
+- An Ubuntu 22.04+ or Debian 12+ server with SSH access (a $12/month DigitalOcean droplet works)
+- API keys for: OpenAI, Anthropic, Replicate (tell them where to get each one if they don't have them)
+
+### Step-by-step installation
+
+1. **SSH into their server** and clone the repo:
+   ```bash
+   ssh user@SERVER_IP
+   git clone https://github.com/jbellsolutions/yt-editor-pipeline.git
+   cd yt-editor-pipeline
+   ```
+
+2. **Run the setup script** — it's interactive, prompts for API keys:
+   ```bash
+   chmod +x scripts/setup.sh
+   sudo ./scripts/setup.sh
+   ```
+   The script will:
+   - Install system deps (Python 3, Node.js 20, FFmpeg, Nginx)
+   - Create a `yt-editor` service user
+   - Copy source files to `/opt/yt-editor/`
+   - Create Python venv and install requirements
+   - Build the Next.js frontend
+   - Prompt for OpenAI, Anthropic, and Replicate API keys
+   - Create systemd services
+   - Run a health check
+
+3. **YouTube OAuth setup** — Walk the user through this carefully:
+   - Go to https://console.cloud.google.com
+   - Create a project (or use existing)
+   - Enable "YouTube Data API v3" in APIs & Services > Library
+   - Create OAuth 2.0 Client ID (type: Web application) in Credentials
+   - Add redirect URI: `http://localhost:8000/auth/callback`
+   - Download the JSON file
+   - Copy it to the server: `scp client_secret.json user@SERVER:/opt/yt-editor/backend/config/`
+   - SSH tunnel: `ssh -L 8000:localhost:8000 user@SERVER_IP`
+   - Open http://localhost:8000/auth/youtube in browser and authorize
+   - Restart: `sudo systemctl restart yt-backend`
+
+4. **Verify** — Open `http://SERVER_IP` in browser. Should see the dashboard.
+   - Health check: `curl http://SERVER_IP/health`
+   - Should show `youtube: true` if OAuth worked
+
+### After installation
+Tell the user:
+- Go to `http://YOUR_SERVER_IP` to open the dashboard
+- Two tabs: "Video URL / Upload" for quick processing, "Chat Editor" to talk to the AI editor
+- Paste any video URL, it processes automatically
+- Review the edit, shorts, thumbnails, then approve to upload to YouTube
+- Cost is about $0.15-0.25 per video
+
+---
+
+## Operational Rules
 
 These rules govern ALL agent behavior in this workspace. They are non-negotiable.
 
