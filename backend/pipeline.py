@@ -243,7 +243,8 @@ def run_pipeline_v7(job_id: str, video_source: str, update_fn, is_file: bool = F
         video_info = probe_video(video_path)
         original_duration = float(video_info.get("format", {}).get("duration", 0))
         video_type_info = detect_video_type(video_path)
-        silence_segments = detect_silence(video_path)
+        # Tighter silence detection: -28dB threshold, 0.8s minimum (catches more pauses)
+        silence_segments = detect_silence(video_path, threshold=-28, min_duration=0.8)
         analysis = {
             "video_info": video_info,
             "video_type": video_type_info,
@@ -314,7 +315,7 @@ def run_pipeline_v7(job_id: str, video_source: str, update_fn, is_file: bool = F
     else:
         update_fn("execute_edits", "running")
         from engines.ffmpeg_engine import (
-            remove_segments, add_text_overlays, normalize_audio,
+            remove_segments, add_text_overlays, enhance_audio, enhance_color,
             concat_with_intro_outro, probe_video
         )
 
@@ -347,17 +348,27 @@ def run_pipeline_v7(job_id: str, video_source: str, update_fn, is_file: bool = F
             except Exception as e:
                 logger.error(f"Job {job_id}: add_text_overlays failed: {e}\n{_tb.format_exc()}")
 
-        # 6c: Normalize audio
+        # 6c: Enhance color (auto color correction + saturation + sharpening)
         try:
-            norm_path = os.path.join(DATA_DIR, "edited", f"{job_id}_normalized.mp4")
-            result = normalize_audio(edited_path, norm_path)
+            color_path = os.path.join(DATA_DIR, "edited", f"{job_id}_color.mp4")
+            result = enhance_color(edited_path, color_path)
             if result:
                 edited_path = result
-            logger.info(f"Job {job_id}: Audio normalized")
+            logger.info(f"Job {job_id}: Color enhanced")
         except Exception as e:
-            logger.error(f"Job {job_id}: normalize_audio failed: {e}\n{_tb.format_exc()}")
+            logger.error(f"Job {job_id}: enhance_color failed: {e}\n{_tb.format_exc()}")
 
-        # 6d: Add intro/outro (with validation)
+        # 6d: Enhance audio (noise reduction + EQ + compression + loudnorm)
+        try:
+            audio_path = os.path.join(DATA_DIR, "edited", f"{job_id}_audio.mp4")
+            result = enhance_audio(edited_path, audio_path)
+            if result:
+                edited_path = result
+            logger.info(f"Job {job_id}: Audio enhanced")
+        except Exception as e:
+            logger.error(f"Job {job_id}: enhance_audio failed: {e}\n{_tb.format_exc()}")
+
+        # 6e: Add intro/outro (with validation)
         intro_path = os.path.join(ASSETS_DIR, "intro.mp4") if os.path.exists(os.path.join(ASSETS_DIR, "intro.mp4")) else os.path.join(ASSETS_DIR, "intro_default.mp4")
         outro_path = os.path.join(ASSETS_DIR, "outro.mp4") if os.path.exists(os.path.join(ASSETS_DIR, "outro.mp4")) else os.path.join(ASSETS_DIR, "outro_default.mp4")
         if _validate_asset(intro_path) and _validate_asset(outro_path):

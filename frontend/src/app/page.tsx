@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import ChatEditor from "../components/ChatEditor";
 
 /* ─── Types ─── */
 
@@ -84,8 +85,6 @@ interface AssetStatus {
 const API = "/api";
 
 const stepLabels: Record<string, string> = {
-  heygen_generate: "Avatar generated",
-  compose_ugc: "Video composed",
   download: "Downloaded",
   transcribe: "Transcribed",
   analyze: "Video analyzed",
@@ -222,15 +221,8 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // V8: Avatar + UGC generation state
-  type InputMode = "url" | "avatar" | "ugc";
+  type InputMode = "url" | "chat";
   const [inputMode, setInputMode] = useState<InputMode>("url");
-  const [avatarScript, setAvatarScript] = useState("");
-  const [avatarId, setAvatarId] = useState("");
-  const [ugcBrief, setUgcBrief] = useState("");
-  const [ugcStyle, setUgcStyle] = useState("testimonial");
-  const [ugcPersona, setUgcPersona] = useState("young professional");
-  const [ugcDuration, setUgcDuration] = useState(30);
-  const [ugcVoiceGender, setUgcVoiceGender] = useState("female");
   const [descriptionTemplate, setDescriptionTemplate] = useState("");
   const [customDescription, setCustomDescription] = useState("");
   const [videoInstructions, setVideoInstructions] = useState("");
@@ -292,60 +284,6 @@ export default function Home() {
 
   /* ─── Handlers ─── */
 
-  const handleAvatarSubmit = async () => {
-    if (!avatarScript.trim()) return;
-    setLoading(true);
-    setError("");
-    try {
-      const res = await fetch(`${API}/generate/avatar`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          script: avatarScript,
-          avatar_id: avatarId,
-        }),
-      });
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || "Failed to submit avatar generation");
-      }
-      setAvatarScript("");
-      await fetchJobs();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleUgcSubmit = async () => {
-    if (!ugcBrief.trim()) return;
-    setLoading(true);
-    setError("");
-    try {
-      const res = await fetch(`${API}/generate/ugc`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          brief: ugcBrief,
-          style: ugcStyle,
-          persona: ugcPersona,
-          duration: ugcDuration,
-          voice_gender: ugcVoiceGender,
-        }),
-      });
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || "Failed to submit UGC generation");
-      }
-      setUgcBrief("");
-      await fetchJobs();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const handleUrlSubmit = async () => {
     if (!videoUrl.trim()) return;
@@ -536,8 +474,7 @@ export default function Home() {
         <div className="flex gap-1 mb-4 bg-gray-800 rounded-lg p-1">
           {[
             { key: "url" as InputMode, label: "Video URL / Upload", icon: "🎬" },
-            { key: "avatar" as InputMode, label: "Avatar Video", icon: "🧑" },
-            { key: "ugc" as InputMode, label: "UGC / Testimonial", icon: "📣" },
+            { key: "chat" as InputMode, label: "Chat Editor", icon: "💬" },
           ].map((tab) => (
             <button
               key={tab.key}
@@ -703,110 +640,10 @@ export default function Home() {
           </>
         )}
 
-        {/* Avatar Video Mode */}
-        {inputMode === "avatar" && (
-          <div className="mb-10 space-y-4">
-            <div className="bg-gray-800/50 border border-gray-700 rounded-xl p-6">
-              <h3 className="text-lg font-semibold mb-1">Create Avatar Video</h3>
-              <p className="text-gray-400 text-sm mb-4">
-                Write a script and your AI avatar will deliver it. The video then goes through
-                the full editing pipeline: captions, shorts, thumbnails, and publishing.
-              </p>
-              <textarea
-                value={avatarScript}
-                onChange={(e) => setAvatarScript(e.target.value)}
-                placeholder="Write your script here. Your avatar will speak these exact words..."
-                rows={6}
-                className="w-full bg-gray-900 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 resize-y"
-              />
-              <div className="flex gap-3 mt-3">
-                <input
-                  type="text"
-                  value={avatarId}
-                  onChange={(e) => setAvatarId(e.target.value)}
-                  placeholder="Avatar ID (leave empty for default)"
-                  className="flex-1 bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
-                />
-                <button
-                  onClick={handleAvatarSubmit}
-                  disabled={loading || !avatarScript.trim()}
-                  className="bg-purple-600 hover:bg-purple-700 disabled:opacity-50 px-6 py-2.5 rounded-lg font-semibold transition"
-                >
-                  {loading ? "Generating..." : "Generate Avatar Video"}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* UGC Mode — AI-Generated Authentic Content */}
-        {inputMode === "ugc" && (
-          <div className="mb-10 space-y-4">
-            <div className="bg-gray-800/50 border border-gray-700 rounded-xl p-6">
-              <h3 className="text-lg font-semibold mb-1">Create AI UGC Video</h3>
-              <p className="text-gray-400 text-sm mb-4">
-                Describe your product or topic. AI agents will write the script, generate faces,
-                animate scenes, add voiceover, and assemble a finished UGC video. ~$1-2 per video.
-              </p>
-              <div className="flex gap-3 mb-3">
-                <select
-                  value={ugcStyle}
-                  onChange={(e) => setUgcStyle(e.target.value)}
-                  className="bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
-                >
-                  <option value="testimonial">Testimonial</option>
-                  <option value="review">Product Review</option>
-                  <option value="unboxing">Unboxing</option>
-                  <option value="reaction">Reaction</option>
-                </select>
-                <select
-                  value={ugcPersona}
-                  onChange={(e) => setUgcPersona(e.target.value)}
-                  className="bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
-                >
-                  <option value="young professional">Young Professional</option>
-                  <option value="college student">College Student</option>
-                  <option value="busy parent">Busy Parent</option>
-                  <option value="fitness enthusiast">Fitness Enthusiast</option>
-                  <option value="tech enthusiast">Tech Enthusiast</option>
-                  <option value="small business owner">Small Business Owner</option>
-                </select>
-                <select
-                  value={ugcVoiceGender}
-                  onChange={(e) => setUgcVoiceGender(e.target.value)}
-                  className="bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
-                >
-                  <option value="female">Female Voice</option>
-                  <option value="male">Male Voice</option>
-                </select>
-                <select
-                  value={ugcDuration}
-                  onChange={(e) => setUgcDuration(Number(e.target.value))}
-                  className="bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
-                >
-                  <option value={15}>15s</option>
-                  <option value={30}>30s</option>
-                  <option value={45}>45s</option>
-                  <option value={60}>60s</option>
-                </select>
-              </div>
-              <textarea
-                value={ugcBrief}
-                onChange={(e) => setUgcBrief(e.target.value)}
-                placeholder={"Describe your product or topic. Be specific about what makes it unique.\n\nExample: Protein powder that dissolves instantly in cold water. No chalky texture. 30g protein per scoop. Used by busy professionals who work out before 6am."}
-                rows={5}
-                className="w-full bg-gray-900 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 resize-y"
-              />
-              <div className="flex justify-end mt-3">
-                <button
-                  onClick={handleUgcSubmit}
-                  disabled={loading || !ugcBrief.trim()}
-                  className="bg-orange-600 hover:bg-orange-700 disabled:opacity-50 px-6 py-2.5 rounded-lg font-semibold transition"
-                >
-                  {loading ? "Generating..." : "Generate UGC Video"}
-                </button>
-              </div>
-            </div>
+        {/* Chat Editor Mode */}
+        {inputMode === "chat" && (
+          <div className="mb-10">
+            <ChatEditor onJobCreated={(jobId) => { fetchJobs(); }} />
           </div>
         )}
 

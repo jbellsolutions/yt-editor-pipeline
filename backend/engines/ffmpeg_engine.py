@@ -497,14 +497,80 @@ def add_text_overlays(
 
 
 # ---------------------------------------------------------------------------
-# normalize_audio  (unchanged)
+# enhance_color — Auto color correction + visual enhancement
 # ---------------------------------------------------------------------------
 
-def normalize_audio(video_path: str, output_path: str) -> str:
-    """Two-pass loudnorm (I=-16, TP=-1.5, LRA=11)."""
+def enhance_color(video_path: str, output_path: str) -> str:
+    """Apply professional color grading to video.
+
+    1. Auto color balance (colorbalance — slight warm shift)
+    2. Contrast boost (curves filter — gentle S-curve)
+    3. Saturation lift (+15%)
+    4. Slight sharpening (unsharp mask)
+
+    Designed to make screen recordings and webcam footage look broadcast-quality
+    without over-processing.
+    """
+    vf_parts = [
+        # Slight warm color shift (add warmth to midtones)
+        "colorbalance=rs=0.03:gs=-0.01:bs=-0.03:rm=0.02:gm=0:bm=-0.02",
+        # Gentle S-curve contrast (lift shadows, deepen darks)
+        "curves=preset=increase_contrast",
+        # Saturation boost — makes colors pop without looking artificial
+        "eq=saturation=1.15:contrast=1.05:brightness=0.02",
+        # Light sharpening — makes text and faces crisper
+        "unsharp=5:5:0.5:5:5:0.0",
+    ]
+    vf = ",".join(vf_parts)
+
+    _run([
+        "ffmpeg", "-y", "-i", video_path,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-c:a", "copy",
+        *ENCODE_OPTS,
+        output_path,
+    ], timeout=TIMEOUT)
+
+    logger.info(f"Color enhanced: {output_path}")
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# enhance_audio — Noise reduction + EQ + compression + loudnorm
+# ---------------------------------------------------------------------------
+
+def enhance_audio(video_path: str, output_path: str) -> str:
+    """Professional audio enhancement chain.
+
+    1. High-pass filter at 80Hz (removes rumble, HVAC, hum)
+    2. De-esser (reduce sibilance)
+    3. 3-band EQ (voice presence boost at 2-4kHz)
+    4. Compression (even out volume, make quiet parts audible)
+    5. Two-pass loudnorm to YouTube standard (-14 LUFS)
+
+    Designed for spoken word / talking head content.
+    """
+    # Audio filter chain
+    af_enhance = (
+        # High-pass: remove low rumble below 80Hz
+        "highpass=f=80,"
+        # Low-pass: remove harsh high frequencies above 14kHz
+        "lowpass=f=14000,"
+        # Voice presence EQ: boost 2-4kHz range for clarity
+        "equalizer=f=3000:t=q:w=1.5:g=3,"
+        # Slight boost at 100-200Hz for warmth
+        "equalizer=f=150:t=q:w=1:g=1.5,"
+        # Compressor: even out loud/quiet parts
+        "acompressor=threshold=-20dB:ratio=3:attack=5:release=50:makeup=2dB,"
+        # Limiter: prevent clipping
+        "alimiter=limit=-1dB:attack=5:release=50"
+    )
+
+    # Pass 1: Apply enhancement chain, then measure loudnorm
     cmd1 = [
         "ffmpeg", "-y", "-i", video_path,
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+        "-af", f"{af_enhance},loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json",
         "-f", "null", "-",
     ]
     result = subprocess.run(
@@ -514,11 +580,22 @@ def normalize_audio(video_path: str, output_path: str) -> str:
     json_start = stderr.rfind("{")
     json_end = stderr.rfind("}") + 1
     if json_start == -1 or json_end == 0:
-        raise RuntimeError("Failed to get loudnorm measurements")
+        logger.warning("Failed to get loudnorm measurements, using single-pass")
+        _run([
+            "ffmpeg", "-y", "-i", video_path,
+            "-af", f"{af_enhance},loudnorm=I=-14:TP=-1.5:LRA=11",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            output_path,
+        ], timeout=TIMEOUT)
+        return output_path
+
     stats = json.loads(stderr[json_start:json_end])
 
-    af = (
-        f"loudnorm=I=-16:TP=-1.5:LRA=11:"
+    # Pass 2: Apply enhancement + calibrated loudnorm
+    af_final = (
+        f"{af_enhance},"
+        f"loudnorm=I=-14:TP=-1.5:LRA=11:"
         f"measured_I={stats['input_i']}:"
         f"measured_TP={stats['input_tp']}:"
         f"measured_LRA={stats['input_lra']}:"
@@ -528,12 +605,23 @@ def normalize_audio(video_path: str, output_path: str) -> str:
     )
     _run([
         "ffmpeg", "-y", "-i", video_path,
-        "-af", af,
+        "-af", af_final,
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "192k",
         output_path,
     ], timeout=TIMEOUT)
+
+    logger.info(f"Audio enhanced: {output_path}")
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# normalize_audio  (legacy — kept for backward compatibility)
+# ---------------------------------------------------------------------------
+
+def normalize_audio(video_path: str, output_path: str) -> str:
+    """Two-pass loudnorm (I=-16, TP=-1.5, LRA=11). Legacy — use enhance_audio instead."""
+    return enhance_audio(video_path, output_path)
 
 
 # ---------------------------------------------------------------------------

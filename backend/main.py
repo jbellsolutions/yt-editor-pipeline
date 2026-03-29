@@ -22,7 +22,15 @@ from youtube_auth import (
 logger = logging.getLogger("yt-pipeline")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-app = FastAPI(title="YT Editor Pipeline", version="7.0.0")
+app = FastAPI(title="YT Editor Pipeline", version="8.0.0")
+
+# Mount chat router
+try:
+    from chat_routes import chat_router
+    app.include_router(chat_router, prefix="/api/chat")
+    logger.info("Chat editor routes mounted at /api/chat")
+except ImportError as e:
+    logger.warning(f"Chat routes not available: {e}")
 
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 
