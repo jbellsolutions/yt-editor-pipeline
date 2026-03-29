@@ -10,3 +10,5 @@ google-auth-oauthlib==1.3.0
 google-auth-httplib2==0.3.0
 google-api-python-client==2.193.0
 yt-dlp
+playwright==1.49.1
+pytest==8.3.4

@@ -8,13 +8,14 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-import anthropic
-from openai import OpenAI
+
+# ─── Configuration ───
 
 DATA_DIR = os.environ.get("DATA_DIR", "/opt/yt-editor/data")
+METADATA_DIR = os.path.join(DATA_DIR, "metadata")
+ASSETS_DIR = "/opt/yt-editor/backend/assets"
 
 logger = logging.getLogger("yt-pipeline")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 ALLOWED_DOMAINS = {
     "www.loom.com", "loom.com",
@@ -26,10 +27,10 @@ MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 5, 10]
 
 
-# ─── Retry Helper ───
+# ─── Retry Helper (preserved from v5) ───
 
 def retry_on_transient(fn, retries=MAX_RETRIES, label="operation"):
-    """Retry a function on transient errors with exponential backoff."""
+    import anthropic
     last_error = None
     for attempt in range(retries):
         try:
@@ -38,7 +39,7 @@ def retry_on_transient(fn, retries=MAX_RETRIES, label="operation"):
                 TimeoutError) as e:
             last_error = e
             if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
-                raise  # 4xx are not retryable
+                raise
             wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
             logger.warning(f"{label} failed (attempt {attempt+1}/{retries}): {e}. Retrying in {wait}s...")
             time.sleep(wait)
@@ -51,32 +52,27 @@ def retry_on_transient(fn, retries=MAX_RETRIES, label="operation"):
 
 
 def validate_video_url(url: str) -> str:
-    """Validate video URL. Accepts Loom, YouTube, Vimeo, Google Drive, or any direct video URL."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"Invalid URL scheme: {parsed.scheme}")
-    # Allow known video platforms + any URL ending in video extension
     video_extensions = (".mp4", ".mov", ".avi", ".mkv", ".webm")
     is_known_domain = parsed.hostname in ALLOWED_DOMAINS
     is_direct_video = any(parsed.path.lower().endswith(ext) for ext in video_extensions)
     if not is_known_domain and not is_direct_video:
-        # Still allow — yt-dlp supports thousands of sites
         logger.info(f"Non-standard video domain: {parsed.hostname}, will attempt yt-dlp")
     return url
 
 
 def run_subprocess(cmd: list, timeout: int = 300, check: bool = True, label: str = "subprocess"):
-    """Run subprocess with timeout and return code checking."""
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if check and result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
     return result
 
 
-# ─── STEP 1: Download Video ───
+# ─── Download Video (preserved from v5) ───
 
 def download_video_from_url(video_url: str, job_id: str) -> str:
-    """Download video from any URL to inbox directory. Returns filepath."""
     video_url = validate_video_url(video_url)
     outpath = os.path.join(DATA_DIR, "inbox", f"{job_id}.mp4")
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
@@ -86,7 +82,6 @@ def download_video_from_url(video_url: str, job_id: str) -> str:
     is_direct = any(parsed.path.lower().endswith(ext) for ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"))
 
     if is_direct:
-        # Direct video URL — download directly
         def download_direct():
             with httpx.stream("GET", video_url, timeout=300, follow_redirects=True) as stream:
                 stream.raise_for_status()
@@ -94,16 +89,12 @@ def download_video_from_url(video_url: str, job_id: str) -> str:
                     for chunk in stream.iter_bytes(chunk_size=8192):
                         f.write(chunk)
         retry_on_transient(download_direct, label="Direct video download")
-
     elif is_loom:
-        # Loom — try to extract video URL from page source
         def fetch_page():
             resp = httpx.get(video_url, follow_redirects=True, timeout=30)
             resp.raise_for_status()
             return resp.text
-
         html = retry_on_transient(fetch_page, label="Loom page fetch")
-
         extracted_url = None
         patterns = [
             r'"url":"(https://[^"]*\.mp4[^"]*)"',
@@ -115,7 +106,6 @@ def download_video_from_url(video_url: str, job_id: str) -> str:
             if match:
                 extracted_url = match.group(1).replace("\\", "")
                 break
-
         if extracted_url:
             def download_extracted():
                 with httpx.stream("GET", extracted_url, timeout=300) as stream:
@@ -125,409 +115,565 @@ def download_video_from_url(video_url: str, job_id: str) -> str:
                             f.write(chunk)
             retry_on_transient(download_extracted, label="Loom video download")
         else:
-            # Fallback to yt-dlp
-            run_subprocess(
-                ["yt-dlp", "-o", outpath, "--", video_url],
-                timeout=300, label="yt-dlp download"
-            )
+            run_subprocess(["yt-dlp", "-o", outpath, "--", video_url], timeout=300, label="yt-dlp download")
     else:
-        # Any other URL — use yt-dlp (supports 1000+ sites)
-        run_subprocess(
-            ["yt-dlp", "-o", outpath, "--", video_url],
-            timeout=600, label="yt-dlp download"
-        )
+        run_subprocess(["yt-dlp", "-o", outpath, "--", video_url], timeout=600, label="yt-dlp download")
 
     if not os.path.exists(outpath) or os.path.getsize(outpath) < 1000:
         raise Exception("Download failed: file too small or missing")
-
     logger.info(f"Job {job_id}: Downloaded {os.path.getsize(outpath)} bytes")
     return outpath
 
 
-# ─── STEP 2: Transcribe with Whisper ───
+# ═══════════════════════════════════════════════════════════════════════════════
+#  V7 PIPELINE ORCHESTRATOR
+#  - Checkpoint/resume: each step checks for existing output before running
+#  - Long-form caption burning (new step after execute_edits)
+#  - Community post image generation (new step after thumbnails)
+#  - Auto-publish mode: uploads to YouTube after QA passes
+#  Agents communicate via JSON files in METADATA_DIR.
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def transcribe_video(video_path: str, job_id: str) -> dict:
-    """Transcribe video using OpenAI Whisper API. Returns transcript with word timestamps."""
-    audio_path = os.path.join(DATA_DIR, "inbox", f"{job_id}.mp3")
-    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+AUTO_PUBLISH = os.environ.get("AUTO_PUBLISH", "true").lower() in ("true", "1", "yes")
 
-    run_subprocess([
-        "ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "libmp3lame",
-        "-ar", "16000", "-ac", "1", audio_path
-    ], timeout=300, label="Audio extraction")
-
-    client = OpenAI(timeout=120)
-
-    def call_whisper():
-        with open(audio_path, "rb") as f:
-            return client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="verbose_json",
-                timestamp_granularities=["word", "segment"]
-            )
-
-    result = retry_on_transient(call_whisper, label="Whisper transcription")
-
-    transcript_path = os.path.join(DATA_DIR, "metadata", f"{job_id}_transcript.json")
-    os.makedirs(os.path.dirname(transcript_path), exist_ok=True)
-    transcript_data = result.model_dump()
-    with open(transcript_path, "w") as f:
-        json.dump(transcript_data, f, indent=2)
-
-    Path(audio_path).unlink(missing_ok=True)
-
-    logger.info(f"Job {job_id}: Transcribed {len(transcript_data.get('words', []))} words")
-    return transcript_data
+from validation import (
+    validate_intake_result, validate_edit_plan,
+    validate_short_designs, validate_package_result, validate_qa_result,
+)
 
 
-# ─── STEP 3: Remove Filler Words ───
-
-FILLER_WORDS = {
-    "um", "uh", "uhm", "umm", "uhh", "hmm", "hm",
-}
-
-def detect_filler_segments(transcript: dict) -> list:
-    """Find filler word timestamps to cut from video."""
-    filler_segments = []
-    words = transcript.get("words", [])
-
-    for word_info in words:
-        word = word_info.get("word", "").strip().lower().rstrip(".,!?")
-        if word in FILLER_WORDS:
-            start = word_info.get("start", 0)
-            end = word_info.get("end", 0)
-            if end > start:
-                filler_segments.append({"start": start, "end": end, "word": word})
-
-    return filler_segments
-
-
-def remove_fillers_from_video(video_path: str, filler_segments: list, job_id: str) -> str:
-    """Remove filler word segments from video using FFmpeg. Returns cleaned video path."""
-    cleaned_path = os.path.join(DATA_DIR, "cleaned", f"{job_id}.mp4")
-    os.makedirs(os.path.dirname(cleaned_path), exist_ok=True)
-
-    if not filler_segments:
-        run_subprocess(["cp", video_path, cleaned_path], timeout=60, label="Copy (no fillers)")
-        return cleaned_path
-
-    probe = run_subprocess([
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_format", video_path
-    ], timeout=30, label="FFprobe duration")
-    duration = float(json.loads(probe.stdout)["format"]["duration"])
-
-    keep_segments = []
-    current = 0.0
-    for filler in sorted(filler_segments, key=lambda x: x["start"]):
-        if filler["start"] > current:
-            keep_segments.append((current, filler["start"]))
-        current = filler["end"]
-    if current < duration:
-        keep_segments.append((current, duration))
-
-    if not keep_segments:
-        raise Exception("No content remaining after filler removal")
-
-    filter_parts = []
-    inputs = []
-    for i, (start, end) in enumerate(keep_segments):
-        filter_parts.append(
-            f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}];"
-            f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}];"
-        )
-        inputs.append(f"[v{i}][a{i}]")
-
-    filter_complex = "".join(filter_parts)
-    filter_complex += "".join(inputs) + f"concat=n={len(keep_segments)}:v=1:a=1[outv][outa]"
-
-    run_subprocess([
-        "ffmpeg", "-y", "-i", video_path,
-        "-filter_complex", filter_complex,
-        "-map", "[outv]", "-map", "[outa]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        cleaned_path
-    ], timeout=600, label="FFmpeg filler removal")
-
-    if not os.path.exists(cleaned_path) or os.path.getsize(cleaned_path) < 1000:
-        raise Exception("Filler removal failed: output too small")
-
-    logger.info(f"Job {job_id}: Removed {len(filler_segments)} fillers")
-    return cleaned_path
-
-
-# ─── STEP 4: Detect Short Segments via Claude ───
-
-def detect_shorts(transcript: dict, job_id: str) -> list:
-    """Use Claude to find the best 30-60s segments for YouTube Shorts."""
-    segments = transcript.get("segments", [])
-
-    timestamped = ""
-    for seg in segments:
-        start = seg.get("start", 0)
-        end = seg.get("end", 0)
-        text = seg.get("text", "").strip()
-        timestamped += f"[{start:.1f}s - {end:.1f}s] {text}\n"
-
-    client = anthropic.Anthropic(timeout=120.0)
-
-    def call_claude():
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            messages=[{
-                "role": "user",
-                "content": f"""Analyze this video transcript and identify the 2-4 best segments for YouTube Shorts (30-60 seconds each).
-
-Each segment must:
-- Be self-contained (makes sense without context)
-- Have a strong hook in the first 3 seconds
-- Deliver value or entertainment
-- End cleanly (not mid-sentence)
-
-Return ONLY valid JSON array, no other text:
-[
-  {{"start": 12.5, "end": 55.0, "title": "Short title here", "hook": "Why this segment grabs attention"}},
-  ...
-]
-
-TRANSCRIPT:
-{timestamped}"""
-            }]
-        )
-        return message.content[0].text.strip()
-
-    response_text = retry_on_transient(call_claude, label="Claude shorts detection")
-
-    json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-    try:
-        shorts = json.loads(json_match.group()) if json_match else json.loads(response_text)
-    except json.JSONDecodeError:
-        logger.warning(f"Job {job_id}: Claude returned invalid JSON for shorts, retrying...")
-        response_text = retry_on_transient(call_claude, label="Claude shorts retry")
-        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        shorts = json.loads(json_match.group()) if json_match else json.loads(response_text)
-
-    shorts_path = os.path.join(DATA_DIR, "metadata", f"{job_id}_shorts.json")
-    os.makedirs(os.path.dirname(shorts_path), exist_ok=True)
-    with open(shorts_path, "w") as f:
-        json.dump(shorts, f, indent=2)
-
-    logger.info(f"Job {job_id}: Detected {len(shorts)} short segments")
-    return shorts
-
-
-# ─── STEP 5: Create Short Videos ───
-
-def create_shorts(cleaned_video: str, shorts_config: list, job_id: str) -> list:
-    """Extract and crop short segments to 9:16 vertical format."""
-    short_paths = []
-    os.makedirs(os.path.join(DATA_DIR, "shorts"), exist_ok=True)
-
-    probe = run_subprocess([
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", cleaned_video
-    ], timeout=30, label="FFprobe dimensions")
-    streams = json.loads(probe.stdout).get("streams", [])
-    video_stream = next((s for s in streams if s["codec_type"] == "video"), {})
-    width = int(video_stream.get("width", 1920))
-    height = int(video_stream.get("height", 1080))
-
-    target_ratio = 9 / 16
-    current_ratio = width / height
-
-    if current_ratio > target_ratio:
-        new_width = int(height * target_ratio)
-        crop_x = (width - new_width) // 2
-        crop_filter = f"crop={new_width}:{height}:{crop_x}:0,scale=1080:1920"
-    else:
-        new_height = int(width / target_ratio)
-        crop_y = (height - new_height) // 2
-        crop_filter = f"crop={width}:{new_height}:0:{crop_y},scale=1080:1920"
-
-    for i, short in enumerate(shorts_config):
-        out_path = os.path.join(DATA_DIR, "shorts", f"{job_id}_short_{i}.mp4")
-        start = short["start"]
-        duration = short["end"] - short["start"]
-
+def _load_checkpoint(job_id: str, step_name: str):
+    """Load checkpoint JSON if it exists and is valid."""
+    path = os.path.join(METADATA_DIR, f"{job_id}_{step_name}.json")
+    if os.path.exists(path):
         try:
-            run_subprocess([
-                "ffmpeg", "-y", "-i", cleaned_video,
-                "-ss", str(start), "-t", str(duration),
-                "-vf", crop_filter,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                out_path
-            ], timeout=300, label=f"Short {i} creation")
-
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-                short_paths.append(out_path)
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Job {job_id}: Short {i} creation failed: {e}")
-
-    logger.info(f"Job {job_id}: Created {len(short_paths)} shorts")
-    return short_paths
+            with open(path) as f:
+                data = json.load(f)
+            if data:
+                logger.info(f"Job {job_id}: Resuming from checkpoint: {step_name}")
+                return data
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Job {job_id}: Corrupt checkpoint {step_name}, re-running: {e}")
+    return None
 
 
-# ─── STEP 6: Generate SEO Metadata ───
+def _save_checkpoint(job_id: str, step_name: str, data):
+    """Save step output as checkpoint JSON."""
+    os.makedirs(METADATA_DIR, exist_ok=True)
+    path = os.path.join(METADATA_DIR, f"{job_id}_{step_name}.json")
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, default=str)
 
-def generate_seo(transcript: dict, shorts_config: list, job_id: str) -> dict:
-    """Generate SEO-optimized titles, descriptions, and tags."""
-    full_text = transcript.get("text", "")
 
-    client = anthropic.Anthropic(timeout=120.0)
-
-    def call_claude():
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=3000,
-            messages=[{
-                "role": "user",
-                "content": f"""Based on this video transcript, generate SEO-optimized YouTube metadata.
-
-Return ONLY valid JSON, no other text:
-{{
-  "long_form": {{
-    "title": "SEO title under 60 chars, keyword-rich, click-worthy",
-    "description": "Full description with keywords, value proposition, and call to action. Include relevant hashtags. 2-3 paragraphs.",
-    "tags": ["tag1", "tag2", "up to 15 relevant tags"]
-  }},
-  "shorts": [
-    {{
-      "title": "Short title under 60 chars with hook",
-      "description": "Short description with hashtags",
-      "tags": ["tag1", "tag2"]
-    }}
-  ]
-}}
-
-Make titles click-worthy but NOT clickbait. Optimize for YouTube search and suggested videos.
-
-TRANSCRIPT:
-{full_text[:4000]}
-
-SHORTS SEGMENTS:
-{json.dumps(shorts_config, indent=2)}"""
-            }]
-        )
-        return message.content[0].text.strip()
-
-    response_text = retry_on_transient(call_claude, label="Claude SEO generation")
-
-    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+def _validate_asset(path: str) -> bool:
+    """Check if a video asset file is valid (exists, reasonable size, probes OK)."""
+    if not path or not os.path.exists(path):
+        return False
+    if os.path.getsize(path) < 5000:  # Less than 5KB is suspicious
+        logger.warning(f"Asset too small ({os.path.getsize(path)} bytes): {path}")
+        return False
     try:
-        seo_data = json.loads(json_match.group()) if json_match else json.loads(response_text)
-    except json.JSONDecodeError:
-        logger.warning(f"Job {job_id}: Claude returned invalid JSON for SEO, retrying...")
-        response_text = retry_on_transient(call_claude, label="Claude SEO retry")
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        seo_data = json.loads(json_match.group()) if json_match else json.loads(response_text)
-
-    seo_path = os.path.join(DATA_DIR, "metadata", f"{job_id}_seo.json")
-    os.makedirs(os.path.dirname(seo_path), exist_ok=True)
-    with open(seo_path, "w") as f:
-        json.dump(seo_data, f, indent=2)
-
-    logger.info(f"Job {job_id}: SEO metadata generated")
-    return seo_data
+        from engines.ffmpeg_engine import probe_video
+        info = probe_video(path)
+        dur = float(info.get("format", {}).get("duration", 0))
+        if dur < 0.5:
+            logger.warning(f"Asset too short ({dur}s): {path}")
+            return False
+        return True
+    except Exception:
+        logger.warning(f"Asset failed probe: {path}")
+        return False
 
 
-# ─── STEP 7: Generate Thumbnails ───
-
-def generate_thumbnails(seo_data: dict, job_id: str) -> list:
-    """Generate AI thumbnails using Replicate FLUX model."""
-    import replicate
-
-    title = seo_data.get("long_form", {}).get("title", "Video")
-    thumbnail_paths = []
-    os.makedirs(os.path.join(DATA_DIR, "thumbnails"), exist_ok=True)
-
-    prompts = [
-        f"YouTube thumbnail, bold text overlay '{title[:30]}', vibrant colors, high contrast, professional, eye-catching, 1280x720",
-        f"YouTube thumbnail, cinematic style, dramatic lighting, person speaking, topic: {title[:40]}, bold typography, 1280x720",
-        f"YouTube thumbnail, clean modern design, gradient background, bold white text, professional, {title[:30]}, 1280x720",
-        f"YouTube thumbnail, energetic, bright colors, engaging visual, topic about {title[:40]}, YouTube style, 1280x720",
-    ]
-
-    for i, prompt in enumerate(prompts):
-        try:
-            output = replicate.run(
-                "black-forest-labs/flux-schnell",
-                input={
-                    "prompt": prompt,
-                    "num_outputs": 1,
-                    "aspect_ratio": "16:9",
-                    "output_format": "png",
-                }
-            )
-            if output:
-                img_url = output[0] if isinstance(output, list) else str(output)
-                img_data = httpx.get(str(img_url), timeout=60).content
-                thumb_path = os.path.join(DATA_DIR, "thumbnails", f"{job_id}_thumb_{i}.png")
-                with open(thumb_path, "wb") as f:
-                    f.write(img_data)
-                thumbnail_paths.append(thumb_path)
-                logger.info(f"Job {job_id}: Thumbnail {i} generated")
-        except (httpx.TimeoutException, ConnectionError) as e:
-            logger.warning(f"Job {job_id}: Thumbnail {i} transient error: {e}")
-        except Exception as e:
-            logger.error(f"Job {job_id}: Thumbnail {i} failed: {e}")
-
-    return thumbnail_paths
+def _build_transcript_text(transcript_data: dict) -> str:
+    """Build formatted transcript string for agents."""
+    text = ""
+    for seg in transcript_data.get("segments", []):
+        text += f"[{seg.get('start', 0):.1f}s - {seg.get('end', 0):.1f}s] {seg.get('text', '').strip()}\n"
+    if not text:
+        text = transcript_data.get("text", "")
+    return text
 
 
-# ─── MASTER PIPELINE ───
+def run_pipeline_v7(job_id: str, video_source: str, update_fn, is_file: bool = False):
+    """v7 pipeline orchestrator with checkpoint/resume, captions, and auto-publish."""
 
-def run_pipeline(job_id: str, video_source: str, update_fn, is_file: bool = False):
-    """Run the full pipeline. update_fn(step, status) updates job state."""
-    # Step 1: Download (skip if file upload)
+    os.makedirs(METADATA_DIR, exist_ok=True)
+    import traceback as _tb
+
+    # ── Step 1: Download ──────────────────────────────────────────────────────
+    video_path = os.path.join(DATA_DIR, "inbox", f"{job_id}.mp4")
     if is_file:
-        video_path = video_source  # Already on disk
+        video_path = video_source
+        update_fn("download", "complete")
+    elif os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
+        logger.info(f"Job {job_id}: Download checkpoint found, skipping")
         update_fn("download", "complete")
     else:
         update_fn("download", "running")
         video_path = download_video_from_url(video_source, job_id)
         update_fn("download", "complete")
 
-    # Step 2: Transcribe
-    update_fn("transcribe", "running")
-    transcript = transcribe_video(video_path, job_id)
-    update_fn("transcribe", "complete")
+    # ── Step 2: Transcribe ────────────────────────────────────────────────────
+    checkpoint = _load_checkpoint(job_id, "transcript")
+    if checkpoint:
+        transcript_data = checkpoint
+        update_fn("transcribe", "complete")
+    else:
+        update_fn("transcribe", "running")
+        from engines.transcription import transcribe_video
+        transcript_data = transcribe_video(video_path, job_id)
+        _save_checkpoint(job_id, "transcript", transcript_data)
+        update_fn("transcribe", "complete")
+    transcript_text = _build_transcript_text(transcript_data)
 
-    # Step 3: Remove fillers
-    update_fn("filler_removal", "running")
-    fillers = detect_filler_segments(transcript)
-    cleaned_path = remove_fillers_from_video(video_path, fillers, job_id)
-    update_fn("filler_removal", "complete")
+    # ── Step 3: Video Analysis (type detection + silence) ─────────────────────
+    checkpoint = _load_checkpoint(job_id, "analysis")
+    if checkpoint:
+        analysis = checkpoint
+        video_info = analysis["video_info"]
+        original_duration = analysis["original_duration"]
+        video_type_info = analysis["video_type"]
+        silence_segments = analysis["silence_segments"]
+        update_fn("analyze", "complete")
+    else:
+        update_fn("analyze", "running")
+        from engines.ffmpeg_engine import probe_video, detect_video_type, detect_silence
+        video_info = probe_video(video_path)
+        original_duration = float(video_info.get("format", {}).get("duration", 0))
+        video_type_info = detect_video_type(video_path)
+        silence_segments = detect_silence(video_path)
+        analysis = {
+            "video_info": video_info,
+            "video_type": video_type_info,
+            "silence_segments": silence_segments,
+            "original_duration": original_duration,
+        }
+        _save_checkpoint(job_id, "analysis", analysis)
+        logger.info(f"Job {job_id}: Video type: {video_type_info.get('type', 'unknown')}, "
+                    f"Duration: {original_duration:.1f}s, Silences: {len(silence_segments)}")
+        update_fn("analyze", "complete")
 
-    # Step 4: Detect shorts
-    update_fn("short_detection", "running")
-    shorts_config = detect_shorts(transcript, job_id)
-    update_fn("short_detection", "complete")
+    # ── Step 4: Intake Agent ──────────────────────────────────────────────────
+    checkpoint = _load_checkpoint(job_id, "intake")
+    if checkpoint:
+        intake_result = checkpoint
+        update_fn("intake", "complete")
+    else:
+        update_fn("intake", "running")
+        from agents.intake import run_intake_agent
+        intake_result = run_intake_agent(transcript_text, silence_segments, video_info, job_id)
+        intake_result = validate_intake_result(intake_result)
+        _save_checkpoint(job_id, "intake", intake_result)
+        logger.info(f"Job {job_id}: Intake complete — {len(intake_result.get('filler_words', []))} fillers, "
+                    f"rating: {intake_result.get('content_rating', '?')}/10")
+        update_fn("intake", "complete")
 
-    # Step 5: Create shorts
+    # ── Step 5: Editor Agent ──────────────────────────────────────────────────
+    checkpoint = _load_checkpoint(job_id, "edit_plan")
+    if checkpoint:
+        edit_plan = checkpoint
+        update_fn("edit_plan", "complete")
+    else:
+        update_fn("edit_plan", "running")
+        from agents.editor import run_editor_agent
+        edit_plan = run_editor_agent(intake_result, transcript_text, video_info, job_id)
+        edit_plan = validate_edit_plan(edit_plan)
+        _save_checkpoint(job_id, "edit_plan", edit_plan)
+        update_fn("edit_plan", "complete")
+
+    # ── Step 6: Execute Edits (FFmpeg) ────────────────────────────────────────
+    # Check for existing edited video
+    final_edited_path = os.path.join(DATA_DIR, "edited", f"{job_id}_final.mp4")
+    captioned_lf_path = os.path.join(DATA_DIR, "edited", f"{job_id}_captioned.mp4")
+    if os.path.exists(captioned_lf_path) and os.path.getsize(captioned_lf_path) > 1000:
+        edited_path = captioned_lf_path
+        from engines.ffmpeg_engine import probe_video
+        edited_duration_info = probe_video(edited_path)
+        edited_duration = float(edited_duration_info.get("format", {}).get("duration", original_duration))
+        update_fn("execute_edits", "complete")
+        update_fn("caption_longform", "complete")
+    elif os.path.exists(final_edited_path) and os.path.getsize(final_edited_path) > 1000:
+        edited_path = final_edited_path
+        from engines.ffmpeg_engine import probe_video
+        edited_duration_info = probe_video(edited_path)
+        edited_duration = float(edited_duration_info.get("format", {}).get("duration", original_duration))
+        update_fn("execute_edits", "complete")
+        # Still need to burn captions on long-form
+        update_fn("caption_longform", "running")
+        from engines.ffmpeg_engine import burn_captions_longform
+        words = transcript_data.get("words", [])
+        result = burn_captions_longform(edited_path, words, captioned_lf_path)
+        if result:
+            edited_path = result
+            logger.info(f"Job {job_id}: Long-form captions burned")
+        else:
+            logger.warning(f"Job {job_id}: Long-form caption burn failed, using uncaptioned")
+        update_fn("caption_longform", "complete")
+    else:
+        update_fn("execute_edits", "running")
+        from engines.ffmpeg_engine import (
+            remove_segments, add_text_overlays, normalize_audio,
+            concat_with_intro_outro, probe_video
+        )
+
+        edited_path = video_path
+        os.makedirs(os.path.join(DATA_DIR, "edited"), exist_ok=True)
+
+        # 6a: Remove filler words and dead air
+        cut_segments = edit_plan.get("cut_segments", [])
+        if cut_segments:
+            try:
+                segments_to_remove = [{"start": s["start"], "end": s["end"]} for s in cut_segments]
+                cleaned_path = os.path.join(DATA_DIR, "edited", f"{job_id}_cleaned.mp4")
+                result = remove_segments(video_path, segments_to_remove, cleaned_path)
+                if result:
+                    edited_path = result
+                logger.info(f"Job {job_id}: Removed {len(segments_to_remove)} segments")
+            except Exception as e:
+                logger.error(f"Job {job_id}: remove_segments failed: {e}\n{_tb.format_exc()}")
+                edited_path = video_path
+
+        # 6b: Add text overlays
+        overlays = edit_plan.get("text_overlays", [])
+        if overlays and edited_path:
+            try:
+                overlay_path = os.path.join(DATA_DIR, "edited", f"{job_id}_overlay.mp4")
+                result = add_text_overlays(edited_path, overlays, overlay_path)
+                if result:
+                    edited_path = result
+                logger.info(f"Job {job_id}: Added {len(overlays)} text overlays")
+            except Exception as e:
+                logger.error(f"Job {job_id}: add_text_overlays failed: {e}\n{_tb.format_exc()}")
+
+        # 6c: Normalize audio
+        try:
+            norm_path = os.path.join(DATA_DIR, "edited", f"{job_id}_normalized.mp4")
+            result = normalize_audio(edited_path, norm_path)
+            if result:
+                edited_path = result
+            logger.info(f"Job {job_id}: Audio normalized")
+        except Exception as e:
+            logger.error(f"Job {job_id}: normalize_audio failed: {e}\n{_tb.format_exc()}")
+
+        # 6d: Add intro/outro (with validation)
+        intro_path = os.path.join(ASSETS_DIR, "intro.mp4") if os.path.exists(os.path.join(ASSETS_DIR, "intro.mp4")) else os.path.join(ASSETS_DIR, "intro_default.mp4")
+        outro_path = os.path.join(ASSETS_DIR, "outro.mp4") if os.path.exists(os.path.join(ASSETS_DIR, "outro.mp4")) else os.path.join(ASSETS_DIR, "outro_default.mp4")
+        if _validate_asset(intro_path) and _validate_asset(outro_path):
+            try:
+                result = concat_with_intro_outro(edited_path, intro_path, outro_path, final_edited_path)
+                if result:
+                    edited_path = result
+                logger.info(f"Job {job_id}: Intro/outro added")
+            except Exception as e:
+                logger.error(f"Job {job_id}: concat_with_intro_outro failed: {e}\n{_tb.format_exc()}")
+        else:
+            logger.info(f"Job {job_id}: Skipping intro/outro (assets not valid)")
+
+        edited_duration_info = probe_video(edited_path)
+        edited_duration = float(edited_duration_info.get("format", {}).get("duration", original_duration))
+        logger.info(f"Job {job_id}: Edits complete — {original_duration:.1f}s -> {edited_duration:.1f}s "
+                    f"({original_duration - edited_duration:.1f}s removed)")
+        update_fn("execute_edits", "complete")
+
+        # ── Step 6.5: Burn captions on long-form video ───────────────────────
+        update_fn("caption_longform", "running")
+        from engines.ffmpeg_engine import burn_captions_longform
+        words = transcript_data.get("words", [])
+        result = burn_captions_longform(edited_path, words, captioned_lf_path)
+        if result:
+            edited_path = result
+            logger.info(f"Job {job_id}: Long-form captions burned ({len(words)} words)")
+        else:
+            logger.warning(f"Job {job_id}: Long-form caption burn failed, using uncaptioned")
+        update_fn("caption_longform", "complete")
+
+    # ── Step 7: Short Creator Agent ───────────────────────────────────────────
+    checkpoint = _load_checkpoint(job_id, "short_designs")
+    if checkpoint:
+        short_designs = checkpoint
+        update_fn("short_design", "complete")
+    else:
+        update_fn("short_design", "running")
+        from agents.short_creator import run_short_creator_agent
+        short_designs = run_short_creator_agent(transcript_text, intake_result, edited_duration, job_id)
+        short_designs = validate_short_designs(short_designs)
+        _save_checkpoint(job_id, "short_designs", short_designs)
+        logger.info(f"Job {job_id}: Designed {len(short_designs)} shorts")
+        update_fn("short_design", "complete")
+
+    # ── Step 8: Create Shorts (FFmpeg) ────────────────────────────────────────
     update_fn("short_creation", "running")
-    short_paths = create_shorts(cleaned_path, shorts_config, job_id)
+    from engines.ffmpeg_engine import create_short_with_restructure, burn_captions_animated, concat_short_with_bumpers
+
+    short_paths = []
+    os.makedirs(os.path.join(DATA_DIR, "shorts"), exist_ok=True)
+
+    for i, design in enumerate(short_designs):
+        # Check for existing final short
+        existing_final = os.path.join(DATA_DIR, "shorts", f"{job_id}_short_{i}_final.mp4")
+        existing_captioned = os.path.join(DATA_DIR, "shorts", f"{job_id}_short_{i}_captioned.mp4")
+        if os.path.exists(existing_final) and os.path.getsize(existing_final) > 1000:
+            short_paths.append(existing_final)
+            continue
+        if os.path.exists(existing_captioned) and os.path.getsize(existing_captioned) > 1000:
+            short_paths.append(existing_captioned)
+            continue
+
+        try:
+            raw_short_path = os.path.join(DATA_DIR, "shorts", f"{job_id}_short_{i}_raw.mp4")
+            result = create_short_with_restructure(video_path, design, raw_short_path, video_type_info)
+            if not result:
+                logger.error(f"Job {job_id}: Short {i} creation failed")
+                continue
+
+            short_words = [w for w in transcript_data.get("words", [])
+                          if w.get("start", 0) >= design["start"] and w.get("end", 0) <= design["end"]]
+
+            captioned_path = os.path.join(DATA_DIR, "shorts", f"{job_id}_short_{i}_captioned.mp4")
+            result = burn_captions_animated(raw_short_path, short_words, captioned_path)
+            final_short = result if result else raw_short_path
+
+            short_intro = os.path.join(ASSETS_DIR, "short_intro.mp4")
+            short_outro = os.path.join(ASSETS_DIR, "short_outro.mp4")
+            has_intro = _validate_asset(short_intro)
+            has_outro = _validate_asset(short_outro)
+            if has_intro or has_outro:
+                bumper_path = os.path.join(DATA_DIR, "shorts", f"{job_id}_short_{i}_final.mp4")
+                si = short_intro if has_intro else None
+                so = short_outro if has_outro else None
+                result = concat_short_with_bumpers(final_short, si, so, bumper_path)
+                if result:
+                    final_short = result
+
+            short_paths.append(final_short)
+        except Exception as e:
+            logger.error(f"Job {job_id}: Short {i} creation failed: {e}", exc_info=True)
+            continue
+
+    logger.info(f"Job {job_id}: Created {len(short_paths)}/{len(short_designs)} shorts")
     update_fn("short_creation", "complete")
 
-    # Step 6: SEO
-    update_fn("seo_generation", "running")
-    seo_data = generate_seo(transcript, shorts_config, job_id)
-    update_fn("seo_generation", "complete")
+    # ── Step 9: Packager Agent (SEO + Community Posts) ────────────────────────
+    checkpoint = _load_checkpoint(job_id, "package")
+    if checkpoint:
+        package_result = checkpoint
+        update_fn("packaging", "complete")
+    else:
+        update_fn("packaging", "running")
+        from agents.packager import run_packager_agent
+        package_result = run_packager_agent(transcript_text, intake_result, short_designs, job_id)
+        package_result = validate_package_result(package_result)
+        _save_checkpoint(job_id, "package", package_result)
+        update_fn("packaging", "complete")
 
-    # Step 7: Thumbnails
-    update_fn("thumbnail_generation", "running")
-    thumbnail_paths = generate_thumbnails(seo_data, job_id)
-    update_fn("thumbnail_generation", "complete")
+    # ── Step 10: Thumbnail (single high-converting) ──────────────────────────
+    update_fn("thumbnail_gen", "running")
+    from engines.thumbnail import (
+        generate_single_thumbnail, generate_short_thumbnail,
+    )
 
-    return {
-        "video_path": cleaned_path,
+    long_form_seo = package_result.get("long_form", {})
+    thumbnail_headlines = long_form_seo.get("thumbnail_headlines", [])
+    topic_summary = long_form_seo.get("title", "Video content")
+    title_variants = long_form_seo.get("title_variants", [topic_summary])
+
+    # Pick the single strongest headline (packager lists them in priority order)
+    best_headline = thumbnail_headlines[0] if thumbnail_headlines else topic_summary
+
+    single_thumb = generate_single_thumbnail(video_path, best_headline, topic_summary, job_id)
+    long_form_thumbs = [single_thumb] if single_thumb else []
+
+    short_thumbs = []
+    shorts_seo = package_result.get("shorts", [])
+    for i, design in enumerate(short_designs):
+        if i < len(short_paths):
+            thumb_text = (shorts_seo[i].get("thumbnail_text", design.get("title", ""))
+                         if i < len(shorts_seo) else design.get("title", ""))
+            thumb = generate_short_thumbnail(short_paths[i], design, thumb_text, job_id, i)
+            short_thumbs.append(thumb)
+
+    update_fn("thumbnail_gen", "complete")
+
+    # ── Step 10.5: Community Post Images ──────────────────────────────────────
+    update_fn("community_images", "running")
+    from engines.thumbnail import generate_community_post_image
+    community_posts = package_result.get("community_posts", [])
+    for i, post in enumerate(community_posts):
+        try:
+            # Frame-based image
+            frame_img = generate_community_post_image(
+                video_path, post.get("text", ""), job_id, i, method="frame"
+            )
+            if frame_img:
+                post["frame_image"] = frame_img
+
+            # AI-generated image (if Replicate key available)
+            if os.environ.get("REPLICATE_API_TOKEN"):
+                ai_img = generate_community_post_image(
+                    video_path, post.get("text", ""), job_id, i, method="ai"
+                )
+                if ai_img:
+                    post["ai_image"] = ai_img
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Community post {i} image failed: {e}")
+    update_fn("community_images", "complete")
+
+    # ── Step 11: QA Review ────────────────────────────────────────────────────
+    update_fn("qa_review", "running")
+    from agents.qa import run_qa_agent
+    qa_result = run_qa_agent(short_designs, package_result, transcript_text, job_id)
+    qa_result = validate_qa_result(qa_result)
+
+    flagged = qa_result.get("flagged_shorts", [])
+    if flagged:
+        logger.info(f"Job {job_id}: QA flagged shorts at indices: {flagged}")
+
+    update_fn("qa_review", "complete")
+
+    # ── Build result ──────────────────────────────────────────────────────────
+    result = {
+        "video_path": edited_path,
         "short_paths": short_paths,
-        "shorts_config": shorts_config,
-        "seo_data": seo_data,
-        "thumbnail_paths": thumbnail_paths,
-        "filler_count": len(fillers),
-        "transcript": transcript,
+        "short_designs": short_designs,
+        "seo_data": package_result,
+        "thumbnail_paths": long_form_thumbs,
+        "thumbnail_data": {
+            "long_form": long_form_thumbs,
+            "shorts": [[t] if t else [] for t in short_thumbs],
+        },
+        "short_thumbnail_paths": short_thumbs,
+        "qa_scores": qa_result,
+        "community_posts": community_posts,
+        "filler_count": len(intake_result.get("filler_words", [])),
+        "transcript": transcript_data,
+        "video_type": video_type_info,
+        "original_duration": original_duration,
+        "edited_duration": edited_duration,
+        "title_variants": title_variants,
+        "intake_result": intake_result,
+        "edit_plan": edit_plan,
+        "captioned_longform": edited_path,
     }
+
+    # ── Step 12: Auto-Publish ─────────────────────────────────────────────────
+    # ── Step 12a: Community Post Automation ────────────────────────────────────
+    if AUTO_PUBLISH and community_posts:
+        update_fn("community_posts", "running")
+        try:
+            from engines.community_poster import post_community_updates
+            post_results = post_community_updates(community_posts)
+            posted_count = sum(1 for r in post_results if r.get("status") == "posted")
+            logger.info(f"Job {job_id}: Community posts: {posted_count}/{len(community_posts)} posted")
+            result["community_post_results"] = post_results
+        except ImportError:
+            logger.info(f"Job {job_id}: Community poster not available (playwright not installed)")
+            result["community_post_results"] = []
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Community post automation failed: {e}")
+            result["community_post_results"] = []
+        update_fn("community_posts", "complete")
+
+    if AUTO_PUBLISH:
+        qa_passed = qa_result.get("verdict", "").upper() == "PASS" or qa_result.get("passed", False)
+        if qa_passed:
+            update_fn("auto_publish", "running")
+            try:
+                publish_result = _auto_publish(job_id, result, update_fn)
+                result["auto_published"] = True
+                result["youtube_video_id"] = publish_result.get("video_id")
+                result["youtube_short_ids"] = publish_result.get("short_ids", [])
+                logger.info(f"Job {job_id}: Auto-published! Video: {publish_result.get('video_id')}")
+                update_fn("auto_publish", "complete")
+            except Exception as e:
+                logger.error(f"Job {job_id}: Auto-publish failed: {e}\n{_tb.format_exc()}")
+                result["auto_published"] = False
+                result["auto_publish_error"] = str(e)
+                update_fn("auto_publish", "failed")
+        else:
+            logger.info(f"Job {job_id}: QA did not pass, skipping auto-publish")
+            result["auto_published"] = False
+            result["auto_publish_skip_reason"] = "QA did not pass"
+
+    return result
+
+
+def _auto_publish(job_id: str, result: dict, update_fn) -> dict:
+    """Upload long-form video + shorts + thumbnails to YouTube."""
+    from youtube_auth import get_youtube_service, upload_video, upload_thumbnail
+
+    yt = get_youtube_service()
+    if not yt:
+        raise Exception("YouTube not authenticated — cannot auto-publish")
+
+    seo = result.get("seo_data", {})
+    long_form_seo = seo.get("long_form", {})
+    shorts_seo = seo.get("shorts", [])
+    thumbnail_data = result.get("thumbnail_data", {"long_form": [], "shorts": []})
+
+    # Resolve title
+    title_variants = result.get("title_variants", [])
+    if not title_variants:
+        title_variants = long_form_seo.get("title_variants",
+                         [long_form_seo.get("title", f"Video {job_id}")])
+    chosen_title = title_variants[0] if title_variants else f"Video {job_id}"
+
+    # Upload long-form
+    video_response = retry_on_transient(
+        lambda: upload_video(
+            filepath=result["video_path"],
+            title=chosen_title,
+            description=long_form_seo.get("description", ""),
+            tags=long_form_seo.get("tags", []),
+            privacy="private",
+        ),
+        label="YouTube long-form upload",
+    )
+    video_id = video_response.get("id")
+    logger.info(f"Job {job_id}: Long-form uploaded: {video_id}")
+
+    # Upload long-form thumbnail
+    long_thumbs = thumbnail_data.get("long_form", [])
+    if long_thumbs:
+        try:
+            retry_on_transient(
+                lambda: upload_thumbnail(video_id, long_thumbs[0]),
+                label="YouTube long-form thumbnail",
+            )
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Long-form thumbnail upload failed: {e}")
+
+    # Upload shorts
+    short_ids = []
+    short_thumbs_data = thumbnail_data.get("shorts", [])
+    for i, short_path in enumerate(result.get("short_paths", [])):
+        short_seo = shorts_seo[i] if i < len(shorts_seo) else {}
+        short_title = short_seo.get("title", f"Short {i+1} from {chosen_title}")
+        short_desc = short_seo.get("description", "")
+        short_tags = short_seo.get("tags", long_form_seo.get("tags", [])[:5])
+
+        short_resp = retry_on_transient(
+            lambda sp=short_path, st=short_title, sd=short_desc, stg=short_tags: upload_video(
+                filepath=sp, title=st, description=sd, tags=stg, privacy="private",
+            ),
+            label=f"YouTube short {i} upload",
+        )
+        short_id = short_resp.get("id")
+        short_ids.append(short_id)
+        logger.info(f"Job {job_id}: Short {i} uploaded: {short_id}")
+
+        if i < len(short_thumbs_data) and short_thumbs_data[i]:
+            try:
+                retry_on_transient(
+                    lambda sid=short_id, st=short_thumbs_data[i][0]: upload_thumbnail(sid, st),
+                    label=f"YouTube short {i} thumbnail",
+                )
+            except Exception as e:
+                logger.warning(f"Job {job_id}: Short {i} thumbnail upload failed: {e}")
+
+    return {"video_id": video_id, "short_ids": short_ids, "title": chosen_title}
+
+
+# ─── Backward-compatible aliases ───
+run_pipeline_v6 = run_pipeline_v7
+run_pipeline = run_pipeline_v7
