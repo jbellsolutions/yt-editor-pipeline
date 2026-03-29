@@ -30,7 +30,7 @@ interface JobResult {
   thumbnail_paths?: string[];
   thumbnail_data?: { long_form: string[]; shorts: string[][] };
   short_thumbnail_paths?: (string | null)[];
-  community_posts?: { text: string; type: string }[];
+  community_posts?: { text: string; type: string; frame_image?: string; ai_image?: string }[];
   qa_scores?: {
     passed?: boolean;
     coherence_score?: number;
@@ -226,10 +226,16 @@ export default function Home() {
   const [inputMode, setInputMode] = useState<InputMode>("url");
   const [avatarScript, setAvatarScript] = useState("");
   const [avatarId, setAvatarId] = useState("");
-  const [ugcScript, setUgcScript] = useState("");
-  const [ugcTemplate, setUgcTemplate] = useState("testimonial");
-  const [speakerName, setSpeakerName] = useState("");
-  const [speakerTitle, setSpeakerTitle] = useState("");
+  const [ugcBrief, setUgcBrief] = useState("");
+  const [ugcStyle, setUgcStyle] = useState("testimonial");
+  const [ugcPersona, setUgcPersona] = useState("young professional");
+  const [ugcDuration, setUgcDuration] = useState(30);
+  const [ugcVoiceGender, setUgcVoiceGender] = useState("female");
+  const [descriptionTemplate, setDescriptionTemplate] = useState("");
+  const [customDescription, setCustomDescription] = useState("");
+  const [videoInstructions, setVideoInstructions] = useState("");
+  const [savedTemplates, setSavedTemplates] = useState<{id: string; name: string; content: string}[]>([]);
+  const [newTemplateName, setNewTemplateName] = useState("");
 
   /* ─── API calls ─── */
 
@@ -238,8 +244,8 @@ export default function Home() {
       const res = await fetch(`${API}/jobs`);
       const data = await res.json();
       setJobs((data.jobs || []).reverse());
-    } catch {
-      /* polling */
+    } catch (err) {
+      console.warn("Failed to fetch jobs:", err);
     }
   }, []);
 
@@ -247,8 +253,8 @@ export default function Home() {
     try {
       const res = await fetch(`/auth/status`);
       setAuthStatus(await res.json());
-    } catch {
-      /* ignore */
+    } catch (err) {
+      console.warn("Failed to fetch auth status:", err);
     }
   }, []);
 
@@ -258,8 +264,20 @@ export default function Home() {
       if (res.ok) {
         setAssetStatus(await res.json());
       }
-    } catch {
-      /* ignore */
+    } catch (err) {
+      console.warn("Failed to fetch asset status:", err);
+    }
+  }, []);
+
+  const fetchTemplates = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/templates`);
+      if (res.ok) {
+        const data = await res.json();
+        setSavedTemplates(data.templates || []);
+      }
+    } catch (err) {
+      console.warn("Failed to fetch templates:", err);
     }
   }, []);
 
@@ -267,9 +285,10 @@ export default function Home() {
     fetchJobs();
     fetchAuth();
     fetchAssets();
+    fetchTemplates();
     const interval = setInterval(fetchJobs, 3000);
     return () => clearInterval(interval);
-  }, [fetchJobs, fetchAuth, fetchAssets]);
+  }, [fetchJobs, fetchAuth, fetchAssets, fetchTemplates]);
 
   /* ─── Handlers ─── */
 
@@ -300,7 +319,7 @@ export default function Home() {
   };
 
   const handleUgcSubmit = async () => {
-    if (!ugcScript.trim()) return;
+    if (!ugcBrief.trim()) return;
     setLoading(true);
     setError("");
     try {
@@ -308,18 +327,18 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          script: ugcScript,
-          template: ugcTemplate,
-          speaker_name: speakerName,
-          speaker_title: speakerTitle,
-          avatar_id: avatarId,
+          brief: ugcBrief,
+          style: ugcStyle,
+          persona: ugcPersona,
+          duration: ugcDuration,
+          voice_gender: ugcVoiceGender,
         }),
       });
       if (!res.ok) {
         const data = await res.json();
         throw new Error(data.detail || "Failed to submit UGC generation");
       }
-      setUgcScript("");
+      setUgcBrief("");
       await fetchJobs();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unknown error");
@@ -336,7 +355,7 @@ export default function Home() {
       const res = await fetch(`${API}/ingest`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ video_url: videoUrl }),
+        body: JSON.stringify({ video_url: videoUrl, description_template: descriptionTemplate, custom_description: customDescription, instructions: videoInstructions }),
       });
       if (!res.ok) {
         const data = await res.json();
@@ -467,20 +486,30 @@ export default function Home() {
       <div className="border-b border-gray-800 px-8 py-4 flex justify-between items-center">
         <h1 className="text-2xl font-bold">YT Editor Pipeline</h1>
         <div className="flex items-center gap-4">
-          {/* Asset status */}
+          {/* Asset status + upload */}
           {assetStatus && (
-            <span className="text-xs text-gray-500 border border-gray-700 rounded px-2 py-1">
-              Intro: {assetStatus.intro ? (
-                <span className="text-green-400">&#10003;</span>
-              ) : (
-                <span className="text-red-400">&#10007;</span>
-              )}{" "}
-              | Outro: {assetStatus.outro ? (
-                <span className="text-green-400">&#10003;</span>
-              ) : (
-                <span className="text-red-400">&#10007;</span>
-              )}
-            </span>
+            <div className="flex items-center gap-2 text-xs">
+              <label className={`cursor-pointer border rounded px-2 py-1 transition ${assetStatus.intro ? 'border-green-700 text-green-400' : 'border-red-700 text-red-400 hover:border-red-500'}`}>
+                Intro {assetStatus.intro ? '✓' : '✗'}
+                <input type="file" accept="video/*" className="hidden" onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const fd = new FormData(); fd.append('file', file);
+                  await fetch(`${API}/assets/intro`, { method: 'POST', body: fd });
+                  fetchAssets();
+                }} />
+              </label>
+              <label className={`cursor-pointer border rounded px-2 py-1 transition ${assetStatus.outro ? 'border-green-700 text-green-400' : 'border-red-700 text-red-400 hover:border-red-500'}`}>
+                Outro {assetStatus.outro ? '✓' : '✗'}
+                <input type="file" accept="video/*" className="hidden" onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const fd = new FormData(); fd.append('file', file);
+                  await fetch(`${API}/assets/outro`, { method: 'POST', body: fd });
+                  fetchAssets();
+                }} />
+              </label>
+            </div>
           )}
           <span
             className={
@@ -544,6 +573,100 @@ export default function Home() {
                 {loading ? "Processing..." : "Process URL"}
               </button>
             </div>
+
+            {/* Advanced Options */}
+            <details className="mb-4 bg-gray-800/50 border border-gray-700 rounded-xl">
+              <summary className="px-4 py-3 cursor-pointer text-gray-300 hover:text-white font-medium text-sm">
+                Options (description, template, instructions)
+              </summary>
+              <div className="px-4 pb-4 space-y-3">
+                {/* Description Template Dropdown */}
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">Description Template</label>
+                  <div className="flex gap-2">
+                    <select
+                      value={descriptionTemplate ? "custom" : ""}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === "" || val === "none") {
+                          setDescriptionTemplate("");
+                        } else if (val === "custom") {
+                          // keep current
+                        } else {
+                          const t = savedTemplates.find((t) => t.id === val);
+                          if (t) setDescriptionTemplate(t.content);
+                        }
+                      }}
+                      className="flex-1 bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500"
+                    >
+                      <option value="none">No template</option>
+                      {savedTemplates.map((t) => (
+                        <option key={t.id} value={t.id}>{t.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  {/* Save new template */}
+                  {descriptionTemplate && (
+                    <div className="flex gap-2 mt-2">
+                      <input
+                        type="text"
+                        value={newTemplateName}
+                        onChange={(e) => setNewTemplateName(e.target.value)}
+                        placeholder="Save as template..."
+                        className="flex-1 bg-gray-900 border border-gray-600 rounded-lg px-3 py-1.5 text-white placeholder-gray-500 text-xs focus:outline-none focus:border-blue-500"
+                      />
+                      <button
+                        onClick={async () => {
+                          if (!newTemplateName.trim()) return;
+                          await fetch(`${API}/templates`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ name: newTemplateName, content: descriptionTemplate }),
+                          });
+                          setNewTemplateName("");
+                          fetchTemplates();
+                        }}
+                        className="bg-blue-600 hover:bg-blue-700 px-3 py-1.5 rounded-lg text-xs font-medium transition"
+                      >
+                        Save
+                      </button>
+                    </div>
+                  )}
+                  {/* Template preview/edit */}
+                  <textarea
+                    value={descriptionTemplate}
+                    onChange={(e) => setDescriptionTemplate(e.target.value)}
+                    placeholder={"Select a saved template or type one:\n---\nSubscribe: https://youtube.com/@YourChannel\nFree Resources: https://yoursite.com/free\n---"}
+                    rows={3}
+                    className="w-full mt-2 bg-gray-900 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 resize-y text-sm"
+                  />
+                </div>
+
+                {/* Custom Description */}
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">Description (for this video)</label>
+                  <textarea
+                    value={customDescription}
+                    onChange={(e) => setCustomDescription(e.target.value)}
+                    placeholder="Add a custom description for this specific video. AI will enhance it with SEO optimization."
+                    rows={3}
+                    className="w-full bg-gray-900 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 resize-y text-sm"
+                  />
+                </div>
+
+                {/* Special Instructions */}
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">Special Instructions (for the AI editors)</label>
+                  <textarea
+                    value={videoInstructions}
+                    onChange={(e) => setVideoInstructions(e.target.value)}
+                    placeholder="E.g., Keep the energy high, focus on actionable tips, target audience is entrepreneurs..."
+                    rows={2}
+                    className="w-full bg-gray-900 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 resize-y text-sm"
+                  />
+                </div>
+              </div>
+            </details>
 
             <div
               onDragOver={(e) => {
@@ -616,57 +739,68 @@ export default function Home() {
           </div>
         )}
 
-        {/* UGC / Testimonial Mode */}
+        {/* UGC Mode — AI-Generated Authentic Content */}
         {inputMode === "ugc" && (
           <div className="mb-10 space-y-4">
             <div className="bg-gray-800/50 border border-gray-700 rounded-xl p-6">
-              <h3 className="text-lg font-semibold mb-1">Create UGC / Testimonial Video</h3>
+              <h3 className="text-lg font-semibold mb-1">Create AI UGC Video</h3>
               <p className="text-gray-400 text-sm mb-4">
-                Write a script with your avatar speaking + B-roll cutaways, lower-thirds,
-                and background music. Separate sections with blank lines.
+                Describe your product or topic. AI agents will write the script, generate faces,
+                animate scenes, add voiceover, and assemble a finished UGC video. ~$1-2 per video.
               </p>
               <div className="flex gap-3 mb-3">
                 <select
-                  value={ugcTemplate}
-                  onChange={(e) => setUgcTemplate(e.target.value)}
+                  value={ugcStyle}
+                  onChange={(e) => setUgcStyle(e.target.value)}
                   className="bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
                 >
                   <option value="testimonial">Testimonial</option>
-                  <option value="case_study">Case Study</option>
+                  <option value="review">Product Review</option>
+                  <option value="unboxing">Unboxing</option>
+                  <option value="reaction">Reaction</option>
                 </select>
-                <input
-                  type="text"
-                  value={speakerName}
-                  onChange={(e) => setSpeakerName(e.target.value)}
-                  placeholder="Speaker name"
-                  className="flex-1 bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
-                />
-                <input
-                  type="text"
-                  value={speakerTitle}
-                  onChange={(e) => setSpeakerTitle(e.target.value)}
-                  placeholder="Title / Company"
-                  className="flex-1 bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
-                />
+                <select
+                  value={ugcPersona}
+                  onChange={(e) => setUgcPersona(e.target.value)}
+                  className="bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                >
+                  <option value="young professional">Young Professional</option>
+                  <option value="college student">College Student</option>
+                  <option value="busy parent">Busy Parent</option>
+                  <option value="fitness enthusiast">Fitness Enthusiast</option>
+                  <option value="tech enthusiast">Tech Enthusiast</option>
+                  <option value="small business owner">Small Business Owner</option>
+                </select>
+                <select
+                  value={ugcVoiceGender}
+                  onChange={(e) => setUgcVoiceGender(e.target.value)}
+                  className="bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                >
+                  <option value="female">Female Voice</option>
+                  <option value="male">Male Voice</option>
+                </select>
+                <select
+                  value={ugcDuration}
+                  onChange={(e) => setUgcDuration(Number(e.target.value))}
+                  className="bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                >
+                  <option value={15}>15s</option>
+                  <option value={30}>30s</option>
+                  <option value={45}>45s</option>
+                  <option value={60}>60s</option>
+                </select>
               </div>
               <textarea
-                value={ugcScript}
-                onChange={(e) => setUgcScript(e.target.value)}
-                placeholder={"For case studies, use 3 paragraphs separated by blank lines:\n\nParagraph 1: The Problem\n\nParagraph 2: The Solution\n\nParagraph 3: The Results"}
-                rows={8}
+                value={ugcBrief}
+                onChange={(e) => setUgcBrief(e.target.value)}
+                placeholder={"Describe your product or topic. Be specific about what makes it unique.\n\nExample: Protein powder that dissolves instantly in cold water. No chalky texture. 30g protein per scoop. Used by busy professionals who work out before 6am."}
+                rows={5}
                 className="w-full bg-gray-900 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 resize-y"
               />
-              <div className="flex gap-3 mt-3">
-                <input
-                  type="text"
-                  value={avatarId}
-                  onChange={(e) => setAvatarId(e.target.value)}
-                  placeholder="Avatar ID (leave empty for default)"
-                  className="flex-1 bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
-                />
+              <div className="flex justify-end mt-3">
                 <button
                   onClick={handleUgcSubmit}
-                  disabled={loading || !ugcScript.trim()}
+                  disabled={loading || !ugcBrief.trim()}
                   className="bg-orange-600 hover:bg-orange-700 disabled:opacity-50 px-6 py-2.5 rounded-lg font-semibold transition"
                 >
                   {loading ? "Generating..." : "Generate UGC Video"}
@@ -1104,56 +1238,71 @@ export default function Home() {
                         </div>
                       )}
 
-                      {/* ── Tab 3: Community Posts ── */}
+                      {/* ── Tab 3: Community Posts (Ready-to-Copy Cards) ── */}
                       {tab === "community" && (
-                        <div className="space-y-3">
+                        <div className="space-y-4">
                           {r.community_posts &&
                           r.community_posts.length > 0 ? (
                             <>
+                              <p className="text-gray-400 text-xs">
+                                {r.community_posts.length} post{r.community_posts.length > 1 ? "s" : ""} ready to copy
+                              </p>
                               {r.community_posts.map(
                                 (
-                                  post: { text: string; type: string },
+                                  post: { text: string; type: string; frame_image?: string; ai_image?: string },
                                   pi: number
                                 ) => {
                                   const copyKey = `${job.id}-cp-${pi}`;
+                                  const hasImage = !!(post.frame_image || post.ai_image);
                                   return (
                                     <div
                                       key={pi}
-                                      className="bg-gray-800 rounded-lg p-4 space-y-2"
+                                      className="bg-gray-800 border border-gray-700 rounded-xl p-5 space-y-3"
                                     >
-                                      <div className="flex items-center justify-between">
+                                      {/* Header: badge + image note */}
+                                      <div className="flex items-center gap-2 flex-wrap">
                                         <span
-                                          className={`text-xs px-2 py-0.5 rounded-full ${typeBadgeColor(
+                                          className={`text-xs font-medium px-2.5 py-1 rounded-full ${typeBadgeColor(
                                             post.type
                                           )}`}
                                         >
-                                          {post.type}
+                                          {post.type.replace(/_/g, " ")}
                                         </span>
+                                        {hasImage && (
+                                          <span className="text-xs text-amber-400 bg-amber-400/10 px-2.5 py-1 rounded-full">
+                                            Image available in thumbnails
+                                          </span>
+                                        )}
+                                      </div>
+
+                                      {/* Post text */}
+                                      <p className="text-white text-sm leading-relaxed whitespace-pre-wrap">
+                                        {post.text}
+                                      </p>
+
+                                      {/* Copy button */}
+                                      <div className="pt-1">
                                         <button
                                           onClick={() =>
                                             handleCopy(post.text, copyKey)
                                           }
-                                          className={`px-3 py-1 rounded text-xs transition ${
+                                          className={`w-full sm:w-auto px-5 py-2 rounded-lg text-sm font-medium transition-all ${
                                             copiedIdx === copyKey
-                                              ? "bg-green-700 text-green-200"
-                                              : "bg-gray-700 hover:bg-gray-600 text-gray-300"
+                                              ? "bg-green-600 text-white"
+                                              : "bg-indigo-600 hover:bg-indigo-500 text-white"
                                           }`}
                                         >
                                           {copiedIdx === copyKey
                                             ? "Copied!"
-                                            : "Copy"}
+                                            : "Copy to Clipboard"}
                                         </button>
                                       </div>
-                                      <p className="text-white text-sm">
-                                        {post.text}
-                                      </p>
                                     </div>
                                   );
                                 }
                               )}
-                              <p className="text-gray-600 text-xs mt-1">
-                                Copy and paste into YouTube Studio Community
-                                tab
+                              <p className="text-gray-500 text-xs mt-2">
+                                Paste into YouTube Studio &rarr; Community tab
                               </p>
                             </>
                           ) : (

@@ -88,3 +88,35 @@ These rules govern ALL agent behavior in this workspace. They are non-negotiable
 ## API
 
 52. The OAuth token works. Never suggest generating a new key. If a call fails, fix HOW the call is made.
+
+---
+
+## Self-Healing Protocol (AGI-1)
+
+53. Before fixing any error, check `.claude/healing/patterns.json` for a known fix. If the pattern matches with confidence >= 0.7, apply the fix. If confidence < 0.7, investigate root cause first.
+54. After every successful error fix, log it to `.claude/healing/history.json` with: timestamp, error pattern, fix applied, verification result.
+55. If a fix works that isn't in patterns.json, add it as a new pattern with confidence 0.5. Confidence increases as the pattern is reused successfully.
+56. Classify every error as FATAL (stop pipeline, alert user) or RETRYABLE (auto-retry with backoff). See patterns.json for classification.
+57. Pipeline errors get 3 retry attempts with exponential backoff before escalating to FATAL.
+
+## Self-Learning Protocol (AGI-1)
+
+58. Log observations to `.claude/learning/observations.json`: which instructions get followed vs ignored, which pipeline steps fail most, which agent outputs need the most validation corrections.
+59. Every 5 sessions, review observations for patterns. If a pattern appears 3+ times, generate an insight in `.claude/learning/insights.json`.
+60. Never self-modify CLAUDE.md rules 1-52 without explicit user approval. Rules 53+ can be refined based on evidence.
+61. Track evolution in `.claude/learning/evolution.json`: every self-modification with before/after state and evidence.
+
+## Session Checklist (AGI-1)
+
+### Start of Session
+- [ ] Read CLAUDE.md rules (this file)
+- [ ] Check TODOS.md for blocking tasks
+- [ ] Run `/health` endpoint check (if server is running)
+- [ ] Review `.claude/healing/history.json` for recent failures
+
+### End of Session
+- [ ] All changes tested (hard pass/fail)
+- [ ] No regressions introduced
+- [ ] TODOS.md updated if new blockers found
+- [ ] Healing patterns updated if new error types encountered
+- [ ] Observations logged to `.claude/learning/observations.json`

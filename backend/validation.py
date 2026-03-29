@@ -55,6 +55,27 @@ def validate_edit_plan(data: Any) -> dict:
         if start < 0:
             raise ValidationError(f"cut_segment[{i}] start ({start}) is negative")
 
+    # Detect overlapping cut_segments (would corrupt FFmpeg output)
+    segments = sorted(
+        [(s.get("start", 0), s.get("end", 0)) for s in data.get("cut_segments", [])],
+        key=lambda x: x[0],
+    )
+    for i in range(1, len(segments)):
+        if segments[i][0] < segments[i - 1][1]:
+            logger.warning(
+                f"Overlapping cut_segments detected: segment ending at {segments[i-1][1]} "
+                f"overlaps with segment starting at {segments[i][0]}. Merging."
+            )
+            # Merge overlapping segments in the original data
+            merged = []
+            for seg in sorted(data["cut_segments"], key=lambda s: s.get("start", 0)):
+                if merged and seg.get("start", 0) < merged[-1]["end"]:
+                    merged[-1]["end"] = max(merged[-1]["end"], seg.get("end", 0))
+                else:
+                    merged.append(dict(seg))
+            data["cut_segments"] = merged
+            break
+
     # text_overlays: each must have text, start, end
     for i, overlay in enumerate(data.get("text_overlays", [])):
         if not isinstance(overlay, dict):

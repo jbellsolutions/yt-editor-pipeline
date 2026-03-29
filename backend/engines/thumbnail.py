@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 ENCODE_OPTS = ["-threads", "2"]
 TIMEOUT = 120
-THUMBNAIL_DIR = "/data/thumbnails"
+THUMBNAIL_DIR = os.path.join(os.environ.get("DATA_DIR", "/opt/yt-editor/data"), "thumbnails")
 
 
 def _run(cmd: list, timeout: int = TIMEOUT) -> subprocess.CompletedProcess:
@@ -325,7 +325,11 @@ def generate_ai_thumbnails(
 
 
 def _generate_flux_thumbnail_bg(topic: str, variant_index: int) -> Optional[str]:
-    """Generate a thumbnail background image via Replicate FLUX."""
+    """Generate a compelling thumbnail background image via Replicate FLUX.
+
+    Uses YouTube-proven visual styles: high contrast, bold colors, dramatic
+    lighting. Designed to stand out in a feed of competing thumbnails.
+    """
     try:
         import replicate
         import httpx as _httpx
@@ -333,19 +337,22 @@ def _generate_flux_thumbnail_bg(topic: str, variant_index: int) -> Optional[str]
         if not os.environ.get("REPLICATE_API_TOKEN"):
             return None
 
-        # Different visual styles per variant for A/B testing
+        # YouTube-proven visual styles that drive high CTR
         styles = [
-            "dramatic cinematic lighting, dark moody atmosphere, professional",
-            "bright vibrant colors, energetic, modern clean aesthetic",
-            "warm golden hour lighting, inspiring, professional studio",
+            "dramatic cinematic lighting with deep shadows and vivid highlights, dark background with spotlight effect, rich saturated colors, professional studio quality, ultra sharp focus",
+            "explosive vibrant neon colors on dark background, high contrast pop art style, electric blue and hot orange accents, bold dynamic composition, eye-catching viral aesthetic",
+            "luxurious golden hour warm tones, rich amber and deep teal contrast, professional aspirational aesthetic, bokeh background, premium feel, inspirational mood",
         ]
         style = styles[variant_index % len(styles)]
 
         prompt = (
-            f"YouTube thumbnail background image. Topic: {topic[:200]}. "
+            f"Stunning YouTube thumbnail background, ultra high quality. "
+            f"Topic: {topic[:200]}. "
             f"Style: {style}. "
-            f"No text in the image. No faces. Abstract/conceptual background. "
-            f"16:9 aspect ratio. Ultra high quality, 4K."
+            f"NO TEXT whatsoever. NO words. NO letters. NO numbers. "
+            f"Visually striking abstract or conceptual scene that evokes the topic. "
+            f"Strong visual hierarchy. Bold composition. "
+            f"16:9 aspect ratio. 4K resolution. Photorealistic."
         )
 
         output = replicate.run(
@@ -407,22 +414,29 @@ def generate_single_thumbnail(
             font_path = "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
         font_arg = f":fontfile={font_path}" if os.path.exists(font_path) else ""
 
-        safe_headline = headline.replace("'", "\\'").replace(":", "\\:").replace('"', '\\"')
+        safe_headline = headline.upper().replace("'", "\\'").replace(":", "\\:").replace('"', '\\"')
 
         def _apply_overlay(source_path: str) -> bool:
             """Apply headline overlay onto source_path → output_path."""
             vf_parts = [
                 "scale=1280:720:force_original_aspect_ratio=decrease",
                 "pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-                "eq=contrast=1.12:saturation=1.25:brightness=0.02",
-                # Left-side dark panel for text readability
-                "drawbox=x=0:y=0:w=iw*0.6:h=ih:color=black@0.5:t=fill",
-                # Large bold headline, vertically centered, left-aligned
+                "eq=contrast=1.15:saturation=1.3:brightness=0.02",
+                # Gradient dark panel on left for text readability
+                "drawbox=x=0:y=0:w=iw*0.55:h=ih:color=black@0.55:t=fill",
+                # Shadow layer (offset text for depth effect)
                 (
                     f"drawtext=text='{safe_headline}'"
                     f"{font_arg}"
-                    f":fontsize=92:fontcolor=white"
-                    f":borderw=5:bordercolor=black"
+                    f":fontsize=96:fontcolor=black@0.6"
+                    f":x=54:y=(h-text_h)/2+4"
+                ),
+                # Main headline text — large, bold, white, ALL CAPS
+                (
+                    f"drawtext=text='{safe_headline}'"
+                    f"{font_arg}"
+                    f":fontsize=96:fontcolor=white"
+                    f":borderw=6:bordercolor=black"
                     f":x=50:y=(h-text_h)/2"
                 ),
             ]
@@ -482,18 +496,15 @@ def generate_short_thumbnail(
     job_id: str,
     short_index: int,
 ) -> str:
-    """Generate a single thumbnail for a Short.
+    """Generate a compelling thumbnail for a Short.
 
-    1. Extract frame at hook moment (short_config.hook_start or 25% mark)
-    2. Smart-crop to 9:16
-    3. Add title text overlay (large, centered)
-    4. Add color boost
-    5. Save to /data/thumbnails/{job_id}_short_{i}_thumb.png
-    6. Return path
+    Strategy (priority order):
+    1. FLUX AI background (9:16) + bold title overlay
+    2. Frame extraction at hook moment + crop to 9:16 + title overlay
     """
     try:
         import tempfile
-        from engines.ffmpeg_engine import extract_best_frame, probe_video, smart_crop
+        from engines.ffmpeg_engine import probe_video
 
         os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 
@@ -501,83 +512,164 @@ def generate_short_thumbnail(
             THUMBNAIL_DIR, f"{job_id}_short_{short_index}_thumb.png"
         )
 
+        # Detect font
+        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if not os.path.exists(font_path):
+            font_path = "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
+        font_arg = f":fontfile={font_path}" if os.path.exists(font_path) else ""
+
+        safe_title = " ".join(title.upper().split()[:5])
+        safe_title = safe_title.replace("'", "\\'").replace(":", "\\:").replace('"', '\\"')
+
+        def _apply_short_overlay(source_path: str, is_vertical: bool = False) -> bool:
+            """Apply title overlay for a Short thumbnail."""
+            if is_vertical:
+                # Already 9:16, just add overlay
+                vf_parts = [
+                    "scale=1080:1920:force_original_aspect_ratio=decrease",
+                    "pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+                    "eq=contrast=1.15:saturation=1.3",
+                    "drawbox=x=0:y=ih*0.6:w=iw:h=ih*0.4:color=black@0.55:t=fill",
+                    (
+                        f"drawtext=text='{safe_title}'"
+                        f"{font_arg}"
+                        f":fontsize=80:fontcolor=black@0.5"
+                        f":x=(w-text_w)/2+3:y=ih*0.75+3"
+                    ),
+                    (
+                        f"drawtext=text='{safe_title}'"
+                        f"{font_arg}"
+                        f":fontsize=80:fontcolor=white"
+                        f":borderw=5:bordercolor=black"
+                        f":x=(w-text_w)/2:y=ih*0.75"
+                    ),
+                ]
+            else:
+                # Need to crop 16:9 -> 9:16
+                vf_parts = [
+                    "crop=ih*9/16:ih:(iw-ih*9/16)/2:0",
+                    "scale=1080:1920",
+                    "eq=contrast=1.15:saturation=1.3",
+                    "drawbox=x=0:y=ih*0.6:w=iw:h=ih*0.4:color=black@0.55:t=fill",
+                    (
+                        f"drawtext=text='{safe_title}'"
+                        f"{font_arg}"
+                        f":fontsize=80:fontcolor=black@0.5"
+                        f":x=(w-text_w)/2+3:y=ih*0.75+3"
+                    ),
+                    (
+                        f"drawtext=text='{safe_title}'"
+                        f"{font_arg}"
+                        f":fontsize=80:fontcolor=white"
+                        f":borderw=5:bordercolor=black"
+                        f":x=(w-text_w)/2:y=ih*0.75"
+                    ),
+                ]
+            try:
+                _run([
+                    "ffmpeg", "-y", "-i", source_path,
+                    "-vf", ",".join(vf_parts),
+                    *ENCODE_OPTS,
+                    output_path,
+                ], timeout=TIMEOUT)
+                return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+            except Exception as e:
+                logger.warning(f"Short thumbnail overlay failed: {e}")
+                return False
+
+        # ── Attempt 1: FLUX AI background (9:16 vertical) ──
+        ai_bg = _generate_flux_short_thumbnail_bg(title, short_index)
+        if ai_bg and os.path.exists(ai_bg):
+            success = _apply_short_overlay(ai_bg, is_vertical=True)
+            try:
+                os.remove(ai_bg)
+            except OSError:
+                pass
+            if success:
+                logger.info(f"Short {short_index} thumbnail (AI): {output_path}")
+                return output_path
+
+        # ── Attempt 2: Frame extraction at hook moment ──
         info = probe_video(video_path)
         duration = info["duration"]
-
-        # Determine extraction timestamp
         hook_start = short_config.get("hook_start")
-        if hook_start is not None:
-            ts = float(hook_start)
-        else:
-            ts = duration * 0.25
+        ts = float(hook_start) if hook_start is not None else duration * 0.25
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract frame at the hook moment
             raw_frame = os.path.join(tmpdir, "short_frame.png")
             try:
                 subprocess.run(
-                    [
-                        "ffmpeg", "-y", "-ss", str(ts),
-                        "-i", video_path,
-                        "-frames:v", "1",
-                        "-threads", "2",
-                        raw_frame,
-                    ],
+                    ["ffmpeg", "-y", "-ss", str(ts), "-i", video_path,
+                     "-frames:v", "1", "-threads", "2", raw_frame],
                     capture_output=True, text=True, timeout=30,
                 )
             except Exception:
                 pass
 
-            if not os.path.exists(raw_frame):
-                logger.error("generate_short_thumbnail: frame extraction failed")
-                return None
+            if os.path.exists(raw_frame):
+                success = _apply_short_overlay(raw_frame, is_vertical=False)
+                if success:
+                    logger.info(f"Short {short_index} thumbnail (frame): {output_path}")
+                    return output_path
 
-            # Smart-crop frame to 9:16 using a still image approach
-            cropped_frame = os.path.join(tmpdir, "cropped_frame.png")
-            w, h = info["width"], info["height"]
-
-            # For a still image, apply the crop logic directly
-            crop_w = int(h * 9 / 16)
-            if crop_w > w:
-                crop_w = w
-            x_offset = (w - crop_w) // 2
-
-            # Detect font
-            font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-            if not os.path.exists(font_path):
-                font_path = "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
-            font_arg = f":fontfile={font_path}" if os.path.exists(font_path) else ""
-
-            safe_title = " ".join(title.split()[:5])
-            safe_title = safe_title.replace("'", "\\'").replace(":", "\\:").replace('"', '\\"')
-
-            vf_parts = [
-                f"crop={crop_w}:{h}:{x_offset}:0",
-                "scale=1080:1920",
-                "eq=contrast=1.1:saturation=1.2",
-                (
-                    f"drawtext=text='{safe_title}'"
-                    f"{font_arg}"
-                    f":fontsize=90:fontcolor=white"
-                    f":borderw=4:bordercolor=black"
-                    f":x=(w-text_w)/2:y=(h-text_h)/2"
-                ),
-            ]
-            vf = ",".join(vf_parts)
-
-            _run([
-                "ffmpeg", "-y", "-i", raw_frame,
-                "-vf", vf,
-                *ENCODE_OPTS,
-                output_path,
-            ], timeout=TIMEOUT)
-
-        logger.info(f"generate_short_thumbnail: {output_path}")
-        return output_path
+        logger.error(f"generate_short_thumbnail: all attempts failed for short {short_index}")
+        return None
 
     except Exception as e:
         logger.error(f"generate_short_thumbnail failed: {e}")
         return None
+
+
+def _generate_flux_short_thumbnail_bg(title: str, variant_index: int) -> Optional[str]:
+    """Generate a 9:16 vertical thumbnail background via FLUX for Shorts."""
+    try:
+        import replicate
+        import httpx as _httpx
+
+        if not os.environ.get("REPLICATE_API_TOKEN"):
+            return None
+
+        styles = [
+            "dramatic neon glow on dark background, electric blue and purple, high energy",
+            "bold red and orange gradient, dynamic motion blur effect, intense",
+            "sleek minimal dark aesthetic with bright accent color spotlight",
+        ]
+        style = styles[variant_index % len(styles)]
+
+        prompt = (
+            f"Vertical YouTube Shorts thumbnail background. "
+            f"Topic hint: {title[:150]}. "
+            f"Style: {style}. "
+            f"NO TEXT. NO words. NO letters. NO numbers. "
+            f"Visually striking vertical composition. Bold colors. "
+            f"9:16 aspect ratio. Ultra high quality."
+        )
+
+        output = replicate.run(
+            "black-forest-labs/flux-schnell",
+            input={
+                "prompt": prompt,
+                "num_outputs": 1,
+                "aspect_ratio": "9:16",
+                "output_format": "png",
+            },
+        )
+
+        if output and len(output) > 0:
+            img_url = str(output[0])
+            tmp_path = os.path.join(THUMBNAIL_DIR, f"_flux_short_bg_{variant_index}.png")
+            resp = _httpx.get(img_url, timeout=60)
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                f.write(resp.content)
+            logger.info(f"FLUX short thumbnail bg generated: {tmp_path}")
+            return tmp_path
+
+    except ImportError:
+        logger.info("replicate not installed, skipping AI short thumbnail")
+    except Exception as e:
+        logger.warning(f"FLUX short thumbnail generation failed: {e}")
+    return None
 
 
 # ---------------------------------------------------------------------------

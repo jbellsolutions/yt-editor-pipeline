@@ -75,13 +75,30 @@ Short's content. Generic titles that could apply to any Short are unacceptable.
 Return ONLY valid JSON."""
 
 
-def run(transcript_text: str, intake_result: dict, short_designs: list, job_id: str) -> dict:
+def run(transcript_text: str, intake_result: dict, short_designs: list, job_id: str, extras: dict = None) -> dict:
     """Generate SEO metadata and copy for all content pieces."""
     logger.info(f"[packager] Generating package for job {job_id}")
+    extras = extras or {}
 
     truncated = transcript_text[:TRANSCRIPT_MAX_CHARS]
     if len(transcript_text) > TRANSCRIPT_MAX_CHARS:
         truncated += "\n\n[TRANSCRIPT TRUNCATED]"
+
+    # Build extras context for Claude
+    extras_context = ""
+    description_template = extras.get("description_template", "")
+    custom_description = extras.get("custom_description", "")
+    instructions = extras.get("instructions", "")
+
+    if custom_description:
+        extras_context += f"\n\nCUSTOM DESCRIPTION FROM CREATOR — Use this as the primary description body for the long-form video (you can enhance it but keep the core message):\n{custom_description}"
+    if description_template:
+        extras_context += f"\n\nDESCRIPTION TEMPLATE — Append this to the END of every description (long-form and shorts):\n{description_template}"
+    if instructions:
+        extras_context += f"\n\nSPECIAL INSTRUCTIONS FROM CREATOR:\n{instructions}"
+
+    # Note: Shorts will automatically get a "Watch the full video" link injected
+    # at upload time using the actual YouTube video ID — no need to generate placeholder links
 
     prompt = f"""Generate complete SEO metadata for this video and its Shorts.
 
@@ -93,13 +110,16 @@ SHORT DESIGNS ({len(short_designs)} Shorts):
 
 TRANSCRIPT:
 {truncated}
+{extras_context}
 
 Generate the complete package JSON. Remember:
 - Each Short gets a UNIQUE title based on its specific content
 - Titles use Bencivenga principles (specific, benefit-driven, curiosity gap)
 - Description calibrated to the audience awareness level
 - Thumbnail text must be 3-5 words, high impact, readable at small size
-- Community posts should drive engagement (teaser, question, bold_claim)"""
+- Community posts should drive engagement (teaser, question, bold_claim)
+- If a description template was provided, append it to ALL descriptions
+- If a channel handle was provided, every Short description must link back to the full video"""
 
     result = call_claude_json(
         prompt=prompt,

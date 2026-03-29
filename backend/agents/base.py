@@ -84,7 +84,7 @@ def call_claude_json(
             parse_errors.append(str(e))
             logger.warning(
                 f"JSON parse attempt {attempt + 1} failed: {e}. "
-                f"Raw response preview: {raw[:200] if raw else empty}"
+                f"Raw response preview: {raw[:200] if raw else '(empty)'}"
             )
             if attempt < 2:
                 # Add hint to prompt for retry

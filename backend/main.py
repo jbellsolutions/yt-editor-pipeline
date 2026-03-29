@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, FileResponse
 from pydantic import BaseModel, field_validator
 
-from pipeline import run_pipeline_v7 as run_pipeline, DATA_DIR
+from pipeline import run_pipeline_v7 as run_pipeline, DATA_DIR, ASSETS_DIR
 from youtube_auth import (
     get_auth_url, handle_callback, get_youtube_service,
     upload_video, upload_thumbnail,
@@ -219,6 +219,9 @@ def save_jobs(jobs: dict):
 
 class VideoRequest(BaseModel):
     video_url: str
+    description_template: str = ""
+    custom_description: str = ""
+    instructions: str = ""
     @field_validator("video_url")
     @classmethod
     def validate_url(cls, v):
@@ -300,13 +303,14 @@ V6_STEPS = {
     "thumbnail_gen": "pending",
     "community_images": "pending",
     "qa_review": "pending",
+    "community_posts": "pending",
     "auto_publish": "pending",
 }
 
 
 # ─── Pipeline ───
 
-def run_pipeline_background(job_id: str, video_source: str, is_file: bool = False):
+def run_pipeline_background(job_id: str, video_source: str, is_file: bool = False, extras: dict = None):
     global _active_jobs
     def update_step(step: str, status: str):
         jobs = load_jobs()
@@ -323,7 +327,7 @@ def run_pipeline_background(job_id: str, video_source: str, is_file: bool = Fals
     try:
         with _active_jobs_lock:
             _active_jobs += 1
-        result = run_pipeline(job_id, video_source, update_step, is_file=is_file)
+        result = run_pipeline(job_id, video_source, update_step, is_file=is_file, extras=extras or {})
 
         jobs = load_jobs()
         if job_id in jobs:
@@ -384,12 +388,20 @@ async def ingest_video(req: VideoRequest):
         "status": "queued", "created_at": datetime.utcnow().isoformat(),
         "steps": dict(V6_STEPS),
         "result": {},
+        "description_template": req.description_template,
+        "custom_description": req.custom_description,
+        "instructions": req.instructions,
     }
     jobs = load_jobs()
     jobs[job_id] = job
     save_jobs(jobs)
     log_event(f"Job {job_id} - Created from URL")
-    thread = threading.Thread(target=run_pipeline_background, args=(job_id, req.video_url, False), daemon=True)
+    extras = {
+        "description_template": req.description_template,
+        "custom_description": req.custom_description,
+        "instructions": req.instructions,
+    }
+    thread = threading.Thread(target=run_pipeline_background, args=(job_id, req.video_url, False, extras), daemon=True)
     thread.start()
     return {"job_id": job_id, "status": "queued"}
 
@@ -594,7 +606,16 @@ def approve_job(job_id: str, req: ApproveRequest):
         selected_idx = req.selected_title_index
         if selected_idx < 0 or selected_idx >= len(title_variants):
             selected_idx = 0
-        chosen_title = title_variants[selected_idx]
+        chosen_title = title_variants[selected_idx][:100]  # YouTube max 100 chars
+
+        # ─── Build description with custom desc + template ───
+        desc_template = job.get("description_template", "")
+        custom_desc = job.get("custom_description", "")
+        lf_description = long_form_seo.get("description", "")
+        if custom_desc:
+            lf_description = f"{custom_desc}\n\n{lf_description}"
+        if desc_template and desc_template not in lf_description:
+            lf_description = f"{lf_description}\n\n{desc_template}"
 
         # ─── Upload long-form video ONCE ───
         _update_approve_progress(jobs, job_id, "uploading_longform")
@@ -602,7 +623,7 @@ def approve_job(job_id: str, req: ApproveRequest):
         video_response = upload_video(
             filepath=result["video_path"],
             title=chosen_title,
-            description=long_form_seo.get("description", ""),
+            description=lf_description,
             tags=long_form_seo.get("tags", []),
             privacy="private",
             publish_at=req.publish_at if req.publish_at else None,
@@ -627,9 +648,16 @@ def approve_job(job_id: str, req: ApproveRequest):
             _update_approve_progress(jobs, job_id, f"uploading_short_{i}")
 
             short_seo = shorts_seo[i] if i < len(shorts_seo) else {}
-            short_title = short_seo.get("title", f"Short {i+1} from {chosen_title}")
+            short_title = short_seo.get("title", f"Short {i+1} from {chosen_title}")[:100]
             short_desc = short_seo.get("description", "")
             short_tags = short_seo.get("tags", long_form_seo.get("tags", [])[:5])
+
+            # Inject main video link into each Short's description
+            main_video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+            if main_video_url and main_video_url not in short_desc:
+                short_desc = f"Watch the full video: {main_video_url}\n\n{short_desc}"
+            if desc_template and desc_template not in short_desc:
+                short_desc = f"{short_desc}\n\n{desc_template}"
 
             short_resp = upload_video(
                 filepath=short_path,
@@ -723,6 +751,84 @@ async def upload_outro(file: UploadFile = File(...)):
     return {"status": "ok", "path": dest}
 
 
+# ─── YouTube Cookies (for community posting) ───
+
+COOKIE_PATH = "/opt/yt-editor/backend/config/youtube_cookies.json"
+
+
+@app.get("/api/cookies/status")
+def cookies_status():
+    return {"youtube_cookies": os.path.exists(COOKIE_PATH)}
+
+
+@app.post("/api/cookies/youtube")
+async def upload_youtube_cookies(file: UploadFile = File(...)):
+    """Upload YouTube Studio cookies JSON exported from a local browser."""
+    os.makedirs(os.path.dirname(COOKIE_PATH), exist_ok=True)
+    content = await file.read()
+    # Validate it's valid JSON
+    try:
+        cookies = json.loads(content)
+        if not isinstance(cookies, list):
+            raise ValueError("Expected a list of cookie objects")
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid cookie JSON: {e}")
+
+    with open(COOKIE_PATH, "w") as f:
+        json.dump(cookies, f, indent=2)
+    os.chmod(COOKIE_PATH, 0o600)
+    log_event("YouTube cookies uploaded for community posting")
+    return {"status": "ok", "cookie_count": len(cookies)}
+
+
+# ─── Description Templates ───
+
+TEMPLATES_FILE = os.path.join(DATA_DIR, "description_templates.json")
+
+
+def _load_templates() -> list:
+    if os.path.exists(TEMPLATES_FILE):
+        try:
+            with open(TEMPLATES_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def _save_templates(templates: list):
+    os.makedirs(os.path.dirname(TEMPLATES_FILE), exist_ok=True)
+    with open(TEMPLATES_FILE, "w") as f:
+        json.dump(templates, f, indent=2)
+
+
+@app.get("/api/templates")
+def list_templates():
+    return {"templates": _load_templates()}
+
+
+class TemplateCreate(BaseModel):
+    name: str
+    content: str
+
+
+@app.post("/api/templates")
+def create_template(req: TemplateCreate):
+    templates = _load_templates()
+    template = {"id": str(uuid.uuid4())[:8], "name": req.name, "content": req.content}
+    templates.append(template)
+    _save_templates(templates)
+    return template
+
+
+@app.delete("/api/templates/{template_id}")
+def delete_template(template_id: str):
+    templates = _load_templates()
+    templates = [t for t in templates if t["id"] != template_id]
+    _save_templates(templates)
+    return {"status": "deleted"}
+
+
 # ─── File serving ───
 
 @app.get("/api/thumbnails/{filename}")
@@ -762,16 +868,13 @@ class AvatarRequest(BaseModel):
     run_pipeline: bool = True  # After generating, run full edit/short/publish pipeline
 
 class UGCRequest(BaseModel):
-    """Generate a UGC testimonial/case study video."""
-    script: str
-    template: str = "testimonial"  # "testimonial" or "case_study"
-    speaker_name: str = ""
-    speaker_title: str = ""
-    avatar_id: str = ""
-    voice_id: str = ""
-    broll_ids: list = []  # IDs of uploaded B-roll clips
-    music_id: str = ""  # ID of uploaded music track
-    run_pipeline: bool = True
+    """Generate an AI UGC video from a brief — no human footage needed."""
+    brief: str  # Product/topic description
+    persona: str = "young professional"
+    style: str = "testimonial"  # testimonial, review, unboxing, reaction
+    duration: int = 30  # target seconds (15-60)
+    voice_gender: str = "female"
+    run_pipeline: bool = True  # feed result into edit/short/publish pipeline
 
 
 @app.get("/api/avatars")
@@ -926,41 +1029,44 @@ def _run_avatar_pipeline(job_id: str, req: AvatarRequest):
 
 @app.post("/api/generate/ugc")
 def generate_ugc_video(req: UGCRequest):
-    """Generate a UGC testimonial/case study video, then optionally run pipeline."""
+    """Generate an AI UGC video from a brief using the agent team pipeline."""
     if _active_jobs >= MAX_CONCURRENT_JOBS:
         raise HTTPException(status_code=429, detail="Too many active jobs. Try again shortly.")
 
-    if not req.script.strip():
-        raise HTTPException(status_code=400, detail="Script cannot be empty")
+    if not req.brief.strip():
+        raise HTTPException(status_code=400, detail="Brief cannot be empty")
 
     job_id = uuid.uuid4().hex[:8]
-    steps = dict(V6_STEPS)
-    steps["heygen_generate"] = "pending"
-    steps["compose_ugc"] = "pending"
+    ugc_steps = {
+        "ugc_script": "pending",
+        "ugc_face": "pending",
+        "ugc_scenes": "pending",
+        "ugc_video": "pending",
+        "ugc_voice": "pending",
+        "ugc_assembly": "pending",
+    }
+    steps = {**ugc_steps, **dict(V6_STEPS)} if req.run_pipeline else ugc_steps
 
     job = {
         "id": job_id,
-        "source": f"ugc:{req.template}",
+        "source": f"ugc:{req.style}",
         "source_type": "ugc",
         "status": "queued",
         "created_at": datetime.utcnow().isoformat(),
         "steps": steps,
         "result": {},
         "ugc_config": {
-            "script": req.script,
-            "template": req.template,
-            "speaker_name": req.speaker_name,
-            "speaker_title": req.speaker_title,
-            "avatar_id": req.avatar_id,
-            "voice_id": req.voice_id,
-            "broll_ids": req.broll_ids,
-            "music_id": req.music_id,
+            "brief": req.brief,
+            "persona": req.persona,
+            "style": req.style,
+            "duration": req.duration,
+            "voice_gender": req.voice_gender,
         },
     }
     jobs = load_jobs()
     jobs[job_id] = job
     save_jobs(jobs)
-    log_event(f"Job {job_id} - UGC generation queued ({req.template}, {len(req.script)} chars)")
+    log_event(f"Job {job_id} - UGC generation queued ({req.style}, {req.duration}s)")
 
     thread = threading.Thread(
         target=_run_ugc_pipeline, args=(job_id, req), daemon=True
@@ -970,7 +1076,7 @@ def generate_ugc_video(req: UGCRequest):
 
 
 def _run_ugc_pipeline(job_id: str, req: UGCRequest):
-    """Generate avatar clip → compose UGC video → run pipeline."""
+    """Run the AI UGC agent team pipeline: script → face → scenes → video → voice → assembly."""
     global _active_jobs
 
     def update_step(step: str, status: str):
@@ -985,80 +1091,55 @@ def _run_ugc_pipeline(job_id: str, req: UGCRequest):
             save_jobs(jobs)
             log_event(f"Job {job_id} - {step}: {status}")
 
+    def ugc_status_callback(info: dict):
+        """Translate orchestrator callbacks to job step updates."""
+        step_map = {
+            "script": "ugc_script",
+            "face": "ugc_face",
+            "scenes": "ugc_scenes",
+            "video": "ugc_video",
+            "voice": "ugc_voice",
+            "assembly": "ugc_assembly",
+        }
+        step = step_map.get(info.get("step"), info.get("step", ""))
+        if step:
+            detail = info.get("detail", "")
+            if "complete" in detail.lower() or "done" in detail.lower():
+                update_step(step, "complete")
+            elif "fail" in detail.lower() or "error" in detail.lower():
+                update_step(step, "failed")
+            else:
+                update_step(step, "running")
+
     try:
         with _active_jobs_lock:
             _active_jobs += 1
 
-        # Step 0: Generate avatar clip via HeyGen
-        update_step("heygen_generate", "running")
-        from engines.heygen import create_avatar_video, list_avatars as _list
+        from agents.ugc_orchestrator import run_ugc_pipeline as _run_ugc
 
-        avatar_id = req.avatar_id
-        if not avatar_id:
-            avatars = _list()
-            private = [a for a in avatars if a["type"] == "private"]
-            avatar_id = private[0]["avatar_id"] if private else avatars[0]["avatar_id"]
+        # Mark all UGC steps as running initially
+        update_step("ugc_script", "running")
 
-        avatar_clip = create_avatar_video(
-            script=req.script,
-            avatar_id=avatar_id,
+        ugc_result = _run_ugc(
+            brief=req.brief,
+            persona=req.persona,
+            style=req.style,
+            duration=req.duration,
             job_id=job_id,
-            voice_id=req.voice_id or None,
+            voice_gender=req.voice_gender,
+            update_fn=ugc_status_callback,
         )
-        update_step("heygen_generate", "complete")
 
-        # Step 1: Compose UGC video
-        update_step("compose_ugc", "running")
-        from engines.video_composer import compose_video, build_testimonial_config, build_case_study_config
+        video_path = ugc_result.get("video_path")
+        if not video_path:
+            raise RuntimeError("UGC pipeline produced no video")
 
-        # Resolve B-roll and music paths from asset IDs
-        broll_dir = os.path.join(ASSETS_DIR, "broll")
-        music_dir = os.path.join(ASSETS_DIR, "music")
-        broll_clips = [os.path.join(broll_dir, f"{bid}.mp4") for bid in req.broll_ids
-                       if os.path.exists(os.path.join(broll_dir, f"{bid}.mp4"))]
-        music_path = None
-        if req.music_id:
-            mp = os.path.join(music_dir, f"{req.music_id}.mp3")
-            if os.path.exists(mp):
-                music_path = mp
-
-        # Build composition config based on template
-        # For now, use simple section splitting (script → sections by paragraph)
-        paragraphs = [p.strip() for p in req.script.split("\n\n") if p.strip()]
-        if not paragraphs:
-            paragraphs = [req.script]
-
-        if req.template == "case_study" and len(paragraphs) >= 3:
-            # Map paragraphs to problem/solution/results
-            config = build_case_study_config(
-                avatar_clip=avatar_clip,
-                problem={"text": paragraphs[0], "duration": 15, "key_metric": "THE PROBLEM"},
-                solution={"text": paragraphs[1], "duration": 15, "key_metric": "THE SOLUTION"},
-                results={"text": paragraphs[2], "duration": 15, "key_metric": "THE RESULTS"},
-                broll_clips=broll_clips,
-                music_path=music_path,
-                speaker_name=req.speaker_name,
-                speaker_title=req.speaker_title,
-            )
-        else:
-            # Default: testimonial
-            script_sections = [{"text": p, "duration": max(5, len(p) / 15)}
-                              for p in paragraphs]
-            config = build_testimonial_config(
-                avatar_clip=avatar_clip,
-                script_sections=script_sections,
-                broll_clips=broll_clips,
-                music_path=music_path,
-                speaker_name=req.speaker_name,
-                speaker_title=req.speaker_title,
-            )
-
-        composed_path = compose_video(config, job_id)
-        update_step("compose_ugc", "complete")
-        log_event(f"Job {job_id} - UGC video composed: {composed_path}")
+        log_event(f"Job {job_id} - UGC video generated: {video_path} "
+                  f"(cost: ${ugc_result.get('total_cost', 0):.2f})")
 
         if req.run_pipeline:
-            result = run_pipeline(job_id, composed_path, update_step, is_file=True)
+            # Feed UGC video into the full edit/short/publish pipeline
+            result = run_pipeline(job_id, video_path, update_step, is_file=True)
 
             jobs = load_jobs()
             if job_id in jobs:
@@ -1070,6 +1151,8 @@ def _run_ugc_pipeline(job_id: str, req: UGCRequest):
                 else:
                     jobs[job_id]["status"] = "ready_for_review"
                 jobs[job_id]["result"] = _build_result_dict(result)
+                jobs[job_id]["result"]["ugc_cost"] = ugc_result.get("total_cost", 0)
+                jobs[job_id]["result"]["ugc_script"] = ugc_result.get("script", "")
                 save_jobs(jobs)
 
             status_msg = "Auto-published!" if result.get("auto_published") else "Ready for review."
@@ -1078,7 +1161,12 @@ def _run_ugc_pipeline(job_id: str, req: UGCRequest):
             jobs = load_jobs()
             if job_id in jobs:
                 jobs[job_id]["status"] = "ready_for_review"
-                jobs[job_id]["result"] = {"video_path": composed_path}
+                jobs[job_id]["result"] = {
+                    "video_path": video_path,
+                    "ugc_cost": ugc_result.get("total_cost", 0),
+                    "ugc_script": ugc_result.get("script", ""),
+                    "cost_breakdown": ugc_result.get("cost_breakdown", {}),
+                }
                 save_jobs(jobs)
 
     except Exception as e:

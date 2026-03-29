@@ -1,14 +1,79 @@
+# Python
 __pycache__/
 *.pyc
-.env
+*.pyo
 *.egg-info/
+*.eggs/
+dist/
+build/
 venv/
+.venv/
+*.whl
+
+# Node
 node_modules/
 .next/
+out/
+.turbo/
+
+# Environment / Secrets
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# OAuth / credentials
 config/client_secret.json
 config/youtube_token.json
+config/cookies.json
+backend/config/client_secret.json
+backend/config/youtube_token.json
+backend/config/cookies.json
+*.pem
+*.key
+*.cert
+
+# Data / media files
 data/
 *.mp4
 *.mp3
+*.wav
+*.webm
+*.mkv
+*.avi
+*.mov
+*.flv
 *.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+
+# OS
 .DS_Store
+Thumbs.db
+Desktop.ini
+.Spotlight-V100
+.Trashes
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# Logs
+*.log
+logs/
+
+# Claude agent local data
+.claude/healing/history.json
+.claude/learning/observations.json
+.claude/learning/insights.json
+.claude/learning/evolution.json

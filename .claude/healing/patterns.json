@@ -1,0 +1,146 @@
+{
+  "version": "1.0.0",
+  "patterns": [
+    {
+      "id": "YT-P001",
+      "name": "FFmpeg Not Found",
+      "error_pattern": "FileNotFoundError.*ffmpeg|ffmpeg: command not found",
+      "fix_strategy": "command",
+      "fix_command": "apt-get install -y ffmpeg || brew install ffmpeg",
+      "confidence": 0.9,
+      "applications": 0,
+      "category": "system_dependency"
+    },
+    {
+      "id": "YT-P002",
+      "name": "yt-dlp Download Failure",
+      "error_pattern": "ERROR.*yt.?dlp|Unable to download|HTTP Error 403",
+      "fix_strategy": "command",
+      "fix_command": "pip install --upgrade yt-dlp",
+      "confidence": 0.7,
+      "applications": 0,
+      "category": "download"
+    },
+    {
+      "id": "YT-P003",
+      "name": "Anthropic Rate Limit",
+      "error_pattern": "rate_limit_error|429|overloaded_error",
+      "fix_strategy": "retry_with_backoff",
+      "fix_params": {"initial_wait": 5, "max_retries": 3, "backoff_factor": 2},
+      "confidence": 0.9,
+      "applications": 0,
+      "category": "api"
+    },
+    {
+      "id": "YT-P004",
+      "name": "OpenAI Whisper Timeout",
+      "error_pattern": "ReadTimeout|Connection.*timeout.*openai|whisper.*timeout",
+      "fix_strategy": "retry_with_backoff",
+      "fix_params": {"initial_wait": 10, "max_retries": 2, "backoff_factor": 2},
+      "confidence": 0.8,
+      "applications": 0,
+      "category": "api"
+    },
+    {
+      "id": "YT-P005",
+      "name": "YouTube OAuth Token Expired",
+      "error_pattern": "invalid_grant|Token has been expired|token.*revoked",
+      "fix_strategy": "manual",
+      "fix_description": "Re-authenticate: visit /auth/youtube endpoint to re-authorize",
+      "confidence": 0.9,
+      "applications": 0,
+      "category": "auth"
+    },
+    {
+      "id": "YT-P006",
+      "name": "Disk Space Full",
+      "error_pattern": "No space left on device|ENOSPC|OSError.*28",
+      "fix_strategy": "command",
+      "fix_command": "find /opt/yt-editor/data -name '*.tmp' -mtime +1 -delete && find /opt/yt-editor/data -name '*.part' -mtime +1 -delete",
+      "confidence": 0.7,
+      "applications": 0,
+      "category": "system"
+    },
+    {
+      "id": "YT-P007",
+      "name": "FFmpeg Encoding Error",
+      "error_pattern": "Error while.*encoding|Conversion failed|Invalid data found",
+      "fix_strategy": "edit",
+      "fix_description": "Check input file integrity with ffprobe before processing. Re-download if corrupt.",
+      "confidence": 0.6,
+      "applications": 0,
+      "category": "video_processing"
+    },
+    {
+      "id": "YT-P008",
+      "name": "JSON Parse Failure from Claude",
+      "error_pattern": "JSONDecodeError|Failed to parse JSON|Expecting value",
+      "fix_strategy": "retry_with_hint",
+      "fix_params": {"hint": "Respond with ONLY valid JSON. No markdown, no explanation."},
+      "confidence": 0.8,
+      "applications": 0,
+      "category": "api"
+    },
+    {
+      "id": "YT-P009",
+      "name": "Replicate FLUX Timeout",
+      "error_pattern": "replicate.*timeout|Prediction.*timed out|FLUX.*failed",
+      "fix_strategy": "retry_with_backoff",
+      "fix_params": {"initial_wait": 15, "max_retries": 2, "backoff_factor": 2},
+      "confidence": 0.7,
+      "applications": 0,
+      "category": "api"
+    },
+    {
+      "id": "YT-P010",
+      "name": "Playwright Browser Missing",
+      "error_pattern": "Executable doesn't exist|chromium.*not found|playwright.*install",
+      "fix_strategy": "command",
+      "fix_command": "playwright install chromium",
+      "confidence": 0.9,
+      "applications": 0,
+      "category": "system_dependency"
+    },
+    {
+      "id": "YT-P011",
+      "name": "YouTube Upload Quota Exceeded",
+      "error_pattern": "quotaExceeded|dailyLimitExceeded|uploadLimitExceeded",
+      "fix_strategy": "manual",
+      "fix_description": "YouTube API daily quota exceeded. Wait 24h or request quota increase in Google Cloud Console.",
+      "confidence": 0.9,
+      "applications": 0,
+      "category": "api"
+    },
+    {
+      "id": "YT-P012",
+      "name": "Module Import Error",
+      "error_pattern": "ModuleNotFoundError|ImportError.*No module named",
+      "fix_strategy": "command",
+      "fix_command": "cd /opt/yt-editor/backend && source venv/bin/activate && pip install -r requirements.txt",
+      "confidence": 0.8,
+      "applications": 0,
+      "category": "python"
+    },
+    {
+      "id": "YT-P013",
+      "name": "Checkpoint Corrupt JSON",
+      "error_pattern": "JSONDecodeError.*checkpoint|json.decoder.*checkpoint",
+      "fix_strategy": "command",
+      "fix_command": "rm -f /opt/yt-editor/data/checkpoints/${JOB_ID}/*.json.corrupted",
+      "fix_description": "Delete corrupted checkpoint and re-run from previous step",
+      "confidence": 0.6,
+      "applications": 0,
+      "category": "pipeline"
+    },
+    {
+      "id": "YT-P014",
+      "name": "Permission Denied on Assets",
+      "error_pattern": "PermissionError.*assets|Permission denied.*mp4",
+      "fix_strategy": "command",
+      "fix_command": "chown -R yt-editor:yt-editor /opt/yt-editor/data /opt/yt-editor/backend/assets",
+      "confidence": 0.8,
+      "applications": 0,
+      "category": "system"
+    }
+  ]
+}

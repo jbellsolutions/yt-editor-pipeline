@@ -195,8 +195,9 @@ def _build_transcript_text(transcript_data: dict) -> str:
     return text
 
 
-def run_pipeline_v7(job_id: str, video_source: str, update_fn, is_file: bool = False):
+def run_pipeline_v7(job_id: str, video_source: str, update_fn, is_file: bool = False, extras: dict = None):
     """v7 pipeline orchestrator with checkpoint/resume, captions, and auto-publish."""
+    extras = extras or {}
 
     os.makedirs(METADATA_DIR, exist_ok=True)
     import traceback as _tb
@@ -462,7 +463,7 @@ def run_pipeline_v7(job_id: str, video_source: str, update_fn, is_file: bool = F
     else:
         update_fn("packaging", "running")
         from agents.packager import run_packager_agent
-        package_result = run_packager_agent(transcript_text, intake_result, short_designs, job_id)
+        package_result = run_packager_agent(transcript_text, intake_result, short_designs, job_id, extras=extras)
         package_result = validate_package_result(package_result)
         _save_checkpoint(job_id, "package", package_result)
         update_fn("packaging", "complete")
@@ -554,6 +555,7 @@ def run_pipeline_v7(job_id: str, video_source: str, update_fn, is_file: bool = F
         "intake_result": intake_result,
         "edit_plan": edit_plan,
         "captioned_longform": edited_path,
+        "extras": extras,
     }
 
     # ── Step 12: Auto-Publish ─────────────────────────────────────────────────
@@ -616,14 +618,24 @@ def _auto_publish(job_id: str, result: dict, update_fn) -> dict:
     if not title_variants:
         title_variants = long_form_seo.get("title_variants",
                          [long_form_seo.get("title", f"Video {job_id}")])
-    chosen_title = title_variants[0] if title_variants else f"Video {job_id}"
+    chosen_title = (title_variants[0] if title_variants else f"Video {job_id}")[:100]  # YouTube max 100 chars
+
+    # Build long-form description with custom desc + template
+    extras = result.get("extras", {})
+    lf_description = long_form_seo.get("description", "")
+    custom_desc = extras.get("custom_description", "")
+    desc_template = extras.get("description_template", "")
+    if custom_desc:
+        lf_description = f"{custom_desc}\n\n{lf_description}"
+    if desc_template and desc_template not in lf_description:
+        lf_description = f"{lf_description}\n\n{desc_template}"
 
     # Upload long-form
     video_response = retry_on_transient(
         lambda: upload_video(
             filepath=result["video_path"],
             title=chosen_title,
-            description=long_form_seo.get("description", ""),
+            description=lf_description,
             tags=long_form_seo.get("tags", []),
             privacy="private",
         ),
@@ -643,13 +655,26 @@ def _auto_publish(job_id: str, result: dict, update_fn) -> dict:
         except Exception as e:
             logger.warning(f"Job {job_id}: Long-form thumbnail upload failed: {e}")
 
-    # Upload shorts
+    # Upload shorts — inject main video link into each Short's description
     short_ids = []
     short_thumbs_data = thumbnail_data.get("shorts", [])
+    main_video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+    extras = result.get("extras", {})
+    desc_template = extras.get("description_template", "")
+
     for i, short_path in enumerate(result.get("short_paths", [])):
         short_seo = shorts_seo[i] if i < len(shorts_seo) else {}
-        short_title = short_seo.get("title", f"Short {i+1} from {chosen_title}")
+        short_title = short_seo.get("title", f"Short {i+1} from {chosen_title}")[:100]
         short_desc = short_seo.get("description", "")
+
+        # Inject main video link at the top of each Short description
+        if main_video_url and main_video_url not in short_desc:
+            short_desc = f"Watch the full video: {main_video_url}\n\n{short_desc}"
+
+        # Append description template if provided
+        if desc_template and desc_template not in short_desc:
+            short_desc = f"{short_desc}\n\n{desc_template}"
+
         short_tags = short_seo.get("tags", long_form_seo.get("tags", [])[:5])
 
         short_resp = retry_on_transient(

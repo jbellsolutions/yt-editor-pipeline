@@ -5,8 +5,8 @@ set -euo pipefail
 # Syncs local code to production server and restarts services.
 # Usage: ./scripts/deploy.sh [--backend-only | --frontend-only]
 
-SERVER="root@142.93.54.26"
-REMOTE_DIR="/opt/yt-editor"
+SERVER="${DEPLOY_SERVER:-root@142.93.54.26}"
+REMOTE_DIR="${DEPLOY_DIR:-/opt/yt-editor}"
 
 echo "🚀 Deploying YT Editor Pipeline..."
 
@@ -49,9 +49,13 @@ if [ "$DEPLOY_FRONTEND" = true ]; then
     echo "🔨 Building frontend..."
     ssh "$SERVER" "cd $REMOTE_DIR/frontend && npm install --production=false && npm run build"
 
+    echo "🔨 Verifying build..."
+    ssh "$SERVER" "test -d $REMOTE_DIR/frontend/.next" || { echo "❌ Frontend build failed"; exit 1; }
+
     echo "🔄 Restarting frontend..."
-    ssh "$SERVER" "pm2 restart yt-frontend 2>/dev/null || (cd $REMOTE_DIR/frontend && pm2 start npm --name yt-frontend -- start)"
-    echo "✅ Frontend deployed"
+    ssh "$SERVER" "systemctl restart yt-frontend"
+    sleep 2
+    ssh "$SERVER" "systemctl is-active yt-frontend && echo '✅ Frontend is running' || echo '❌ Frontend failed to start'"
 fi
 
 # ─── Infra configs (only if changed) ───
@@ -60,7 +64,8 @@ rsync -avz infra/nginx.conf "$SERVER:/etc/nginx/sites-enabled/yt-editor"
 rsync -avz infra/yt-backend.service "$SERVER:/etc/systemd/system/yt-backend.service"
 ssh "$SERVER" "nginx -t && systemctl reload nginx && systemctl daemon-reload"
 
+SERVER_IP=$(echo "$SERVER" | sed 's/.*@//')
 echo ""
 echo "✅ Deploy complete!"
-echo "   Dashboard: http://142.93.54.26"
-echo "   Backend:   http://142.93.54.26/health"
+echo "   Dashboard: http://$SERVER_IP"
+echo "   Backend:   http://$SERVER_IP/health"
